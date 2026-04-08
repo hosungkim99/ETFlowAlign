@@ -1,6 +1,7 @@
 # external/diffalign
 
-This directory contains code copied or adapted from DiffAlign.
+This directory contains copied upstream code from DiffAlign.
+
 
 Original project: (https://github.com/kim-iljung/DiffAlign.git)
 
