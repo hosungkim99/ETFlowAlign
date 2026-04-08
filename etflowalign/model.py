@@ -16,7 +16,17 @@ from torch import Tensor, nn
 
 @dataclass
 class AlignmentBatch:
-    """Minimal self-contained batch container for ETFlowAlign."""
+    """Minimal self-contained batch container for ETFlowAlign.
+
+    Attributes:
+        query_pos: Query ligand coordinates with shape ``[Nq, 3]``.
+        query_atom_type: Integer atom type ids for query atoms ``[Nq]``.
+        query_batch: Graph index for each query atom ``[Nq]``.
+        reference_pos: Reference ligand coordinates ``[Nr, 3]``.
+        reference_atom_type: Optional reference atom type ids ``[Nr]``.
+        reference_batch: Graph index for each reference atom ``[Nr]``.
+        pocket_pos: Optional pocket/receptor point coordinates.
+    """
 
     query_pos: Tensor
     query_atom_type: Tensor
@@ -36,6 +46,14 @@ class SimpleTimeEmbedding(nn.Module):
         self.proj = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
     def forward(self, t: Tensor) -> Tensor:
+        """Embed flow time for each graph.
+
+        Args:
+            t: Continuous times in ``[0, 1]`` with shape ``[B]``.
+
+        Returns:
+            Time embeddings with shape ``[B, dim]``.
+        """
         half = self.dim // 2
         if half == 0:
             return t[:, None]
@@ -49,6 +67,16 @@ class SimpleTimeEmbedding(nn.Module):
 
 
 def _segment_mean(x: Tensor, batch: Tensor, num_graphs: int) -> Tensor:
+    """Compute per-graph mean of node features/coordinates.
+
+    Args:
+        x: Node tensor ``[N, D]``.
+        batch: Graph index per node ``[N]``.
+        num_graphs: Number of graphs in the mini-batch.
+
+    Returns:
+        Mean tensor per graph ``[num_graphs, D]``.
+    """
     out = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
     cnt = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
     out.index_add_(0, batch, x)
@@ -58,6 +86,7 @@ def _segment_mean(x: Tensor, batch: Tensor, num_graphs: int) -> Tensor:
 
 def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors: int) -> Tensor:
     """Build intra-graph radius edges with small-N dense fallback (self-contained)."""
+    # src/dst collect directed edges (i -> j) within each graph.
     src, dst = [], []
     num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
     cutoff_sq = cutoff * cutoff
@@ -66,7 +95,7 @@ def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors:
         node_idx = torch.where(batch == g)[0]
         if node_idx.numel() <= 1:
             continue
-        p = pos[node_idx]  # [Ng, 3]
+        p = pos[node_idx]  # Local coordinates for graph g: [Ng, 3]
         diff = p[:, None, :] - p[None, :, :]
         dist_sq = (diff * diff).sum(-1)
         mask = (dist_sq <= cutoff_sq) & (~torch.eye(node_idx.numel(), device=pos.device, dtype=torch.bool))
@@ -104,6 +133,16 @@ class EquivariantBlock(nn.Module):
         self.phi_x = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
 
     def forward(self, h: Tensor, x: Tensor, edge_index: Tensor) -> tuple[Tensor, Tensor]:
+        """Run one equivariant message passing block.
+
+        Args:
+            h: Node scalar features ``[N, H]``.
+            x: Node coordinates ``[N, 3]``.
+            edge_index: Directed edges ``[2, E]``.
+
+        Returns:
+            Updated node features and coordinates.
+        """
         if edge_index.numel() == 0:
             return h, x
 
@@ -164,23 +203,31 @@ class ETFlowAlignModel(nn.Module):
         return direction, dist
 
     def forward(self, batch: AlignmentBatch, t_graph: Tensor) -> Tensor:
-        """Predict query velocity field v_theta(x_t, t, cond)."""
+        """Predict query velocity field ``v_theta(x_t, t, cond)``.
+
+        Args:
+            batch: Alignment mini-batch.
+            t_graph: Time per graph ``[B]``.
+
+        Returns:
+            Velocity vectors for query atoms ``[Nq, 3]``.
+        """
         if batch.query_pos.numel() == 0:
             return torch.zeros_like(batch.query_pos)
 
         num_graphs = int(batch.query_batch.max().item()) + 1
-        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)
-        x = batch.query_pos - com[batch.query_batch]
+        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
+        x = batch.query_pos - com[batch.query_batch]  # Translation-invariant coordinates.
 
-        h_atom = self.atom_embed(batch.query_atom_type)
-        h_t = self.time_embed(t_graph)[batch.query_batch]
-        ref_dir, ref_dist = self._reference_context(batch)
-        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))
+        h_atom = self.atom_embed(batch.query_atom_type)  # Atom identity features.
+        h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
+        ref_dir, ref_dist = self._reference_context(batch)  # Conditioning from reference geometry.
+        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))  # Initial node states.
 
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
         for block in self.blocks:
             h, x = block(h, x, edge_index)
 
-        gate = self.out_gate(h)
-        v = gate * x
+        gate = self.out_gate(h)  # Scalar gate per atom.
+        v = gate * x  # Vector field aligned with equivariant coordinate features.
         return v

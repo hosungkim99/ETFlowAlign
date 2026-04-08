@@ -1,4 +1,8 @@
-"""Public API for the ETFlowAlign scaffold."""
+"""Public API for ETFlowAlign.
+
+This module re-exports the main classes/functions so users can import from
+``etflowalign`` directly without navigating submodules.
+"""
 
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig, flow_matching_step
 from .inference import generate_candidates, rank_candidates

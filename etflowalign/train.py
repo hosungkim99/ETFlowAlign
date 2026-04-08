@@ -18,11 +18,13 @@ from .model import AlignmentBatch, ETFlowAlignModel
 
 @dataclass
 class TrainConfig:
+    """Optimization hyperparameters for ETFlowAlign training."""
     lr: float = 1e-4
     weight_decay: float = 0.0
 
 
 def build_training_components(model: ETFlowAlignModel, train_config: TrainConfig, fm_config: FlowMatchingConfig):
+    """Create matcher + optimizer objects used in training."""
     matcher = AlignmentFlowMatcher(config=fm_config)
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     return matcher, optimizer
@@ -35,6 +37,7 @@ def train_step(
     batch: AlignmentBatch,
     target_query_pos: torch.Tensor,
 ) -> float:
+    """Run one optimization step and return scalar loss."""
     model.train()
     optimizer.zero_grad(set_to_none=True)
     loss = flow_matching_step(model=model, matcher=matcher, batch=batch, target_query_pos=target_query_pos)
@@ -50,15 +53,15 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
     target_query_pos: reference + smooth deformation + translation.
     input query_pos in batch is initialized as noisy source state.
     """
-    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)
-    reference_batch = query_batch.clone()
+    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)  # Graph id per query atom.
+    reference_batch = query_batch.clone()  # Graph id per reference atom.
 
     # Base molecular-like cloud around origin per graph.
-    ref = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)
-    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)
+    ref = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)  # Reference coordinates.
+    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)  # Toy atom ids.
 
     # Construct alignment target from reference with global transform + local deformation.
-    t = torch.randn(batch_size, 3, device=device) * 0.25
+    t = torch.randn(batch_size, 3, device=device) * 0.25  # Per-graph translation.
     target = ref.clone()
     target = target + t[query_batch]
     target = target + 0.05 * torch.sin(target * 2.0)
@@ -79,6 +82,7 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 
 
 def run_training(args: argparse.Namespace) -> None:
+    """Entry point used by CLI: train on synthetic data and save checkpoint."""
     device = torch.device(args.device)
     model = ETFlowAlignModel(hidden_dim=args.hidden_dim, num_blocks=args.num_blocks).to(device)
 
@@ -113,6 +117,7 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    """Define CLI arguments for the standalone training script."""
     p = argparse.ArgumentParser(description="Train ETFlowAlign on synthetic alignment data.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--steps", type=int, default=200)
@@ -131,6 +136,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI main."""
     args = build_argparser().parse_args()
     run_training(args)
 
