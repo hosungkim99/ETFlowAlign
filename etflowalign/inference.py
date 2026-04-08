@@ -1,18 +1,24 @@
+"""Inference script and APIs for ETFlowAlign.
 
-"""Inference entrypoints for ETFlowAlign multi-sample generation."""
+Usage example:
+    python -m etflowalign.inference --checkpoint etflowalign_ckpt.pt --num-samples 16
+"""
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
 from torch import Tensor
 
-from .model import AlignmentBatch
-from .sampler import ETFlowAlignSampler, GuidanceFn
+from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
+from .model import AlignmentBatch, ETFlowAlignModel
+from .sampler import ETFlowAlignSampler, GuidanceFn, ODESamplerConfig
+from .train import make_synthetic_alignment_batch
 
-RankFn = Callable[[Tensor], Tensor]
+RankFn = Callable[[Tensor, AlignmentBatch], Tensor]
 
 
 @dataclass
@@ -27,11 +33,7 @@ def generate_candidates(
     guidance_fn: Optional[GuidanceFn] = None,
     num_samples: int = 8,
 ) -> Tensor:
-    """Generate multiple aligned query candidates.
-
-    Returns:
-        Tensor of shape [num_samples, num_query_atoms, 3]
-    """
+    """Generate aligned query candidates as [num_samples, N, 3]."""
     outputs = []
     for _ in range(num_samples):
         x0 = source_sampler(batch)
@@ -40,16 +42,110 @@ def generate_candidates(
     return torch.stack(outputs, dim=0)
 
 
-def rank_candidates(candidates: Tensor, rank_fn: Optional[RankFn] = None) -> tuple[Tensor, Tensor]:
-    """Rank candidates with pluggable scoring logic.
+def reference_fit_ranker(candidates: Tensor, batch: AlignmentBatch) -> Tensor:
+    """Simple ranking adapter: negative MSE to reference positions per candidate.
 
-    TODO:
-        Connect task-specific ranking metrics (e.g., TanimotoCombo) in downstream code.
+    In real usage this should be replaced with docking/ranking metrics such as
+    TanimotoCombo + pocket-aware scores.
     """
-    if rank_fn is None:
-        scores = torch.zeros(candidates.size(0), device=candidates.device)
-    else:
-        scores = rank_fn(candidates)
+    if batch.reference_pos is None:
+        return torch.zeros(candidates.size(0), device=candidates.device)
 
+    diff = candidates - batch.reference_pos.unsqueeze(0)
+    mse = (diff * diff).mean(dim=(1, 2))
+    return -mse
+
+
+def rank_candidates(candidates: Tensor, batch: AlignmentBatch, rank_fn: Optional[RankFn] = None) -> tuple[Tensor, Tensor]:
+    if rank_fn is None:
+        scores = reference_fit_ranker(candidates, batch)
+    else:
+        scores = rank_fn(candidates, batch)
     order = torch.argsort(scores, descending=True)
     return candidates[order], scores[order]
+
+
+def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
+    """Create a toy pocket guidance: pull query toward pocket center if available."""
+
+    def _guidance(batch: AlignmentBatch, t_graph: Tensor, v: Tensor) -> Tensor:
+        if batch.pocket_pos is None or batch.pocket_pos.numel() == 0:
+            return torch.zeros_like(v)
+        pocket_center = batch.pocket_pos.mean(dim=0, keepdim=True)
+        g = pocket_center - batch.query_pos
+        return scale * g
+
+    return _guidance
+
+
+def run_inference(args: argparse.Namespace) -> None:
+    device = torch.device(args.device)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    model_args = ckpt.get("model_args", {})
+    flow_args = ckpt.get("flow_args", {})
+
+    model = ETFlowAlignModel(**model_args).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    fm = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
+    sampler = ETFlowAlignSampler(
+        model=model,
+        config=ODESamplerConfig(
+            n_steps=args.n_steps,
+            solver=args.solver,
+            guidance_scale=args.guidance_scale,
+            guidance_mode=args.guidance_mode,
+            max_guidance_norm=args.max_guidance_norm,
+        ),
+    )
+
+    # Demo input (replace with real preprocessed task data).
+    batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
+    if args.use_pocket_guidance:
+        batch.pocket_pos = batch.reference_pos + 0.1 * torch.randn_like(batch.reference_pos)
+
+    source_sampler = lambda b: fm.sample_source(b)  # noqa: E731
+    guidance_fn = make_pocket_pull_guidance(scale=1.0) if args.use_pocket_guidance else None
+
+    candidates = generate_candidates(
+        sampler=sampler,
+        batch=batch,
+        source_sampler=source_sampler,
+        guidance_fn=guidance_fn,
+        num_samples=args.num_samples,
+    )
+    ranked, scores = rank_candidates(candidates=candidates, batch=batch)
+
+    print(f"[inference] candidates={candidates.shape}")
+    print(f"[inference] top_score={scores[0].item():.6f}")
+
+    if args.save_path:
+        torch.save({"candidates": ranked.cpu(), "scores": scores.cpu()}, args.save_path)
+        print(f"[inference] saved to: {args.save_path}")
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run ETFlowAlign inference on synthetic demo data.")
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--num-samples", type=int, default=8)
+    p.add_argument("--n-atoms", type=int, default=16)
+    p.add_argument("--n-steps", type=int, default=64)
+    p.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"])
+    p.add_argument("--guidance-scale", type=float, default=0.0)
+    p.add_argument("--guidance-mode", type=str, default="vector_field", choices=["vector_field", "predictor_corrector"])
+    p.add_argument("--max-guidance-norm", type=float, default=5.0)
+    p.add_argument("--use-pocket-guidance", action="store_true")
+    p.add_argument("--save-path", type=str, default="")
+    return p
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    run_inference(args)
+
+
+if __name__ == "__main__":
+    main()
