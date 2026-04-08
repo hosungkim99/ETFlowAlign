@@ -1,5 +1,4 @@
-
-"""Flow-matching objective and probability path design for ETFlowAlign."""
+"""Flow-matching objective and alignment-specific probability path for ETFlowAlign."""
 
 from __future__ import annotations
 
@@ -17,17 +16,18 @@ class FlowMatchingConfig:
     """Configuration for alignment-specific flow matching."""
 
     sigma: float = 0.05
-    source_type: Literal["gaussian", "reference_anchored"] = "gaussian"
+    source_type: Literal["gaussian", "reference_anchored", "query_perturbed"] = "reference_anchored"
+    source_noise_scale: float = 0.5
     time_eps: float = 1e-4
 
 
 class AlignmentFlowMatcher:
-    """Constructs x_t and target vector field u_t for training.
+    """Construct x_t and vector-field target u_t for alignment flow matching.
 
-    Path design (scaffold):
+    Path:
         x_t = (1 - t) * x0 + t * x1 + sigma_t * eps
-        u_t = d/dt x_t = (x1 - x0) + sigma_dot_t * eps
-    where x1 is ground-truth aligned query coordinates.
+        u_t = (x1 - x0) + sigma_dot_t * eps
+    where x1 is target aligned query coordinates.
     """
 
     def __init__(self, config: FlowMatchingConfig) -> None:
@@ -43,31 +43,33 @@ class AlignmentFlowMatcher:
         denom = torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
         return self.config.sigma * 0.5 * (1.0 - 2.0 * t_node) / denom
 
-    def sample_source(self, batch: AlignmentBatch) -> Tensor:
-        if self.config.source_type == "gaussian":
+    def sample_source(self, batch: AlignmentBatch, target_query_pos: Tensor | None = None) -> Tensor:
+        stype = self.config.source_type
+        if stype == "gaussian":
             return torch.randn_like(batch.query_pos)
 
-        # reference_anchored: initialize around reference COM per graph.
-        if batch.reference_pos is None or batch.reference_batch is None:
+        if stype == "query_perturbed" and target_query_pos is not None:
+            return target_query_pos + self.config.source_noise_scale * torch.randn_like(target_query_pos)
+
+        # reference_anchored fallback
+        if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
             return torch.randn_like(batch.query_pos)
 
-        ref = batch.reference_pos
-        ref_batch = batch.reference_batch
-        num_graphs = int(ref_batch.max().item()) + 1
-        centers = torch.zeros(num_graphs, 3, device=ref.device, dtype=ref.dtype)
-        counts = torch.zeros(num_graphs, 1, device=ref.device, dtype=ref.dtype)
-        centers.index_add_(0, ref_batch, ref)
-        counts.index_add_(0, ref_batch, torch.ones_like(ref_batch, dtype=ref.dtype).unsqueeze(-1))
-        centers = centers / counts.clamp_min(1.0)
-        return centers[batch.query_batch] + 0.5 * torch.randn_like(batch.query_pos)
+        num_graphs = int(batch.reference_batch.max().item()) + 1
+        center = torch.zeros(num_graphs, 3, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
+        count = torch.zeros(num_graphs, 1, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
+        center.index_add_(0, batch.reference_batch, batch.reference_pos)
+        count.index_add_(0, batch.reference_batch, torch.ones_like(batch.reference_batch, dtype=batch.reference_pos.dtype).unsqueeze(-1))
+        center = center / count.clamp_min(1.0)
+        return center[batch.query_batch] + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
 
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         t_node = t_graph[batch.query_batch]
-        x0 = self.sample_source(batch)
+        x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
         eps = torch.randn_like(target_query_pos)
+
         sigma = self.sigma_t(t_node).unsqueeze(-1)
         sigma_dot = self.sigma_dot_t(t_node).unsqueeze(-1)
-
         x_t = (1.0 - t_node).unsqueeze(-1) * x0 + t_node.unsqueeze(-1) * target_query_pos + sigma * eps
         u_t = (target_query_pos - x0) + sigma_dot * eps
         return x_t, u_t
