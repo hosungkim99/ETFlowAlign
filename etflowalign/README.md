@@ -17,108 +17,126 @@ path definition
 ## Design summary
 
 velocity target
-Conceptually:
-
-time sampling
 ```text
 ETFlowAlign = DiffAlign task framework
             - diffusion reverse process (DDPM/DDIM-style)
             + flow matching objective + ODE integration
 ```
 
+time sampling
+### Preserved from DiffAlign
+
 training target 생성
-### What is preserved from DiffAlign
+1. Query ligand alignment task under reference context.
+2. Reference-conditioned generation setup.
+3. Direct Cartesian coordinate generation.
+4. Equivariant vector-field output contract.
+5. Pocket-aware guidance as an inference-time steering signal.
+6. Multi-sample generation + ranking compatibility.
 
 을 넣는다.
-1. **Task definition**: query ligand alignment under reference context.
-2. **Reference-conditioned setup**: conditioning remains first-class in the model API.
-3. **Cartesian coordinates**: generation happens directly in atom-level 3D coordinates.
-4. **E(3)-equivariant contract**: the model predicts a per-atom vector field.
-5. **Pocket-aware guidance philosophy**: pocket or physics terms are optional inference-time steering signals.
-6. **Multi-sample + ranking compatibility**: inference supports generating multiple candidates for downstream ranking (e.g., TanimotoCombo).
+### Imported from ET-Flow
 
 즉 diffusion loss를 대체하는 수학적 핵심을 둔다.
-### What is imported from ET-Flow
+1. Flow-matching vector-field regression objective.
+2. Continuous-time vector field `v_theta(x_t, t, cond)`.
+3. Interpolation probability path between source and target states.
+4. ODE solver-based sampling.
 
-1. **Flow matching training objective** (vector field regression).
-2. **Time-dependent vector field model** `v_theta(x_t, t, cond)`.
-3. **Interpolation-based probability path** between source and target coordinates.
-4. **ODE-based sampling** instead of diffusion reverse updates.
-5. Optional ideas retained as extension points:
-   - stochastic sampling,
-   - chirality correction,
-   - stronger equivariant backbones.
+---
 
 ## inference.py
 여기에는:
----
+## File guide
 
 inference entry point
-## Component map
+Read in this order:
 
 evaluation/inference pipeline
-Read these files first:
+1. `model.py` – equivariant vector-field model
+2. `flow_matching.py` – path/source/target and training objective
+3. `sampler.py` – ODE integration and guidance injection
+4. `train.py` – runnable training script (synthetic demo)
+5. `inference.py` – runnable inference script + ranking adapter
 
 를 둔다.
-1. `model.py`: ETFlowAlign model interface and conditional vector-field contract.
-2. `flow_matching.py`: source distribution, path sampling, time sampling, and loss.
-3. `sampler.py`: ODE inference loop and optional guidance injection.
-4. `train.py`: minimal training step wiring.
-5. `inference.py`: multi-sample inference entrypoint.
+`utils.py` remains intentionally lightweight.
 
-`utils.py` intentionally only stores small reusable helpers; core algorithmic logic is kept in the three core modules above.
+---
 
 ## model.py
 가장 중요하다.
----
+## Review points: current scaffold limitations
 
 여기에는:
-## Upstream provenance and redesign notes
+1. **Backbone simplification**: uses a compact EGNN-style block, but not yet a full production molecular transformer.
+2. **Synthetic data only**: training/inference scripts currently run on synthetic alignment batches for smoke testing.
+3. **Guidance placeholder**: pocket guidance is provided as a safe hook with clipping, not yet full UFF physics integration.
+4. **Ranking placeholder**: ranking adapter defaults to a simple geometric score instead of production metrics (e.g., TanimotoCombo + docking score).
+5. **No benchmark pipeline yet**: dataset preprocessing/evaluation scripts for real alignment benchmarks are pending.
 
 ETFlowAlign 전체 모델 구조
-This implementation is informed by:
+---
 
 DiffAlign에서 유지한 부분
-- `external/diffalign/` (task framing, reference conditioning, pocket-aware guidance intent).
-- `external/etflow/` (flow matching objective, time-dependent vector field, ODE sampling structure).
+## Next-commit concrete checklist (per file)
 
 ET-Flow로 바꾼 부분
-### DiffAlign components by migration type
+### `model.py`
+- [ ] Replace compact EGNN-style block with a stronger E(3)-equivariant transformer-style backbone.
+- [ ] Add richer conditioning channels (reference atom features, cross-graph attention).
+- [ ] Add optional chirality-aware auxiliary head.
 
 forward 흐름
-**Preserved conceptually**
-- Alignment task and conditioning semantics.
-- Coordinate-space generation over query atoms.
-- Equivariant prediction target over coordinates.
+### `flow_matching.py`
+- [ ] Add alignment-aware source distributions beyond Gaussian/reference COM (e.g., rigidly perturbed reference-driven prior).
+- [ ] Add alternative path families and ablation flags.
+- [ ] Add robust weighting / curriculum over time samples.
 
 을 넣는다.
-**Replaced entirely**
-- Diffusion schedules, epsilon/v parameterization, reverse diffusion recursion.
-- DDPM/DDIM-specific training and sampling equations.
+### `sampler.py`
+- [ ] Add adaptive-step ODE solver option.
+- [ ] Implement UFF/pocket guidance with predictor-corrector stability safeguards.
+- [ ] Add trajectory logging for debugging stiff dynamics.
 
 이 파일 하나만 봐도
 “아, 이 모델이 어떻게 생겼는지”
 알 수 있어야 한다.
-**Redesigned partially**
-- Source/base state for alignment (not copied from conformer-generation prior as-is).
-- Probability path and target field for alignment-specific generation.
-- Guidance injection policy under ODE integration (stability-aware scaling/clipping).
+### `train.py`
+- [ ] Replace synthetic batch generator with real dataset/datamodule.
+- [ ] Add validation loop and checkpoint-by-metric selection.
+- [ ] Add distributed and mixed-precision training support.
 
 ## sampler.py
 여기에는:
----
+### `inference.py`
+- [ ] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
+- [ ] Add batch inference over benchmark sets and structured output export.
+- [ ] Add reranking ensemble hooks.
 
 inference / generation / integration loop
-## Initial roadmap (this scaffold)
+### `utils.py`
+- [ ] Keep only non-core helpers; avoid moving algorithmic logic here.
 
 Euler / ODE step
+---
 
 iterative update
+## Runnable scripts
 
 를 둔다.
+### Train (synthetic smoke test)
 
 즉 “학습된 flow를 가지고 실제로 어떻게 샘플을 얻는가”를 정리한다.
+```bash
+python -m etflowalign.train \
+  --steps 200 \
+  --batch-size 8 \
+  --n-atoms 16 \
+  --save-path etflowalign_ckpt.pt
+```
 
+### Inference (from trained checkpoint)
 
 ## train.py
 여기에는:
@@ -135,6 +153,18 @@ batch 처리
 
 ## utils.py
 공통 유틸은 여기에 모은다.
+
+하지만 너무 많은 핵심 로직을 여기 숨기면 안 된다.
+
+```bash
+python -m etflowalign.inference \
+  --checkpoint etflowalign_ckpt.pt \
+  --num-samples 16 \
+  --n-steps 64 \
+  --solver heun \
+  --guidance-scale 0.2 \
+  --use-pocket-guidance \
+  --save-path etflowalign_samples.pt
 
 하지만 너무 많은 핵심 로직을 여기 숨기면 안 된다.
 1. **Scaffold phase (current)**
