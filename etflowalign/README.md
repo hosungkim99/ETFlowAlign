@@ -1,4 +1,7 @@
-
+Start here:
+1. `model.py` for the overall architecture
+2. `flow_matching.py` for the training objective
+3. `sampler.py` for inference dynamics
 
 ## flow_matching.py
 
