@@ -14,3 +14,6 @@ This repository includes or will include code copied from or adapted from the fo
 - Original copyright:
   - Copyright (c) 2024 Majdi Hassan, Nikhil Shenoy, Jungyoon Lee
 - License text: `third_party_license/ET-Flow_License`
+
+
+New code under `etflowalign` depends on and integrates these upstream components.
