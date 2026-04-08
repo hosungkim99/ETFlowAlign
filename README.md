@@ -9,3 +9,10 @@ This repository uses or adapts code from the following open-source projects:
 - ET-Flow (MIT License)
 
 The original license texts are provided in `third_party_license/`.
+
+
+ETFlowAlign is a research repository for building a DiffAlign variant that replaces the diffusion component with ET-Flow.
+
+- `external/diffalign`: upstream DiffAlign code
+- `external/etflow`: upstream ET-Flow code
+- `etflowalign`: new integration code built on top of the upstream repositories
