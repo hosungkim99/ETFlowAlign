@@ -200,6 +200,8 @@ def flow_matching_step(
         reference_atom_type=batch.reference_atom_type,
         reference_batch=batch.reference_batch,
         pocket_pos=batch.pocket_pos,
+        query_node_attr=batch.query_node_attr,
+        reference_node_attr=batch.reference_node_attr,
     )
     pred_v = model(step_batch, t_graph=t_graph)
     return matcher.loss(pred_v=pred_v, target_u=u_t, batch_index=batch.query_batch, t_graph=t_graph)

@@ -73,6 +73,8 @@ class ETFlowAlignSampler:
             reference_atom_type=batch.reference_atom_type,
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
+            query_node_attr=batch.query_node_attr,
+            reference_node_attr=batch.reference_node_attr,
         )
         return self.model(cur, t_graph=t_graph)
 
@@ -95,6 +97,8 @@ class ETFlowAlignSampler:
             reference_atom_type=batch.reference_atom_type,
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
+            query_node_attr=batch.query_node_attr,
+            reference_node_attr=batch.reference_node_attr,
         )
         g = self._clip_guidance(guidance_fn(cur, t_graph, v))
 

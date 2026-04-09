@@ -139,23 +139,34 @@ python -m etflowalign/train.py \
 
 ### Inference (from trained checkpoint)
 
-## train.py
-여기에는:
+---
 
-training step
+## Review points: current scaffold limitations
 
-loss 호출
+1. **Backbone simplification**: uses a compact EGNN-style block, but not yet a full production molecular transformer.
+2. **Synthetic data only**: training/inference scripts currently run on synthetic alignment batches for smoke testing.
+3. **Guidance placeholder**: pocket guidance is provided as a safe hook with clipping, not yet full UFF physics integration.
+4. **Ranking plugin baseline**: inference now exposes a pluggable TanimotoCombo+physics ranker, but production docking engines/ROCS plugins still need to be wired for benchmark-grade scoring.
+5. **No benchmark pipeline yet**: dataset preprocessing/evaluation scripts for real alignment benchmarks are pending.
 
-optimizer step
+---
 
-batch 처리
+## Next-commit concrete checklist (per file)
 
-를 둔다.
+### `model.py`
+- [ ] Replace compact EGNN-style block with a stronger E(3)-equivariant transformer-style backbone.
+- [ ] Add richer conditioning channels (reference atom features, cross-graph attention).
+- [ ] Add optional chirality-aware auxiliary head.
 
-## utils.py
-공통 유틸은 여기에 모은다.
+### `flow_matching.py`
+- [ ] Add alignment-aware source distributions beyond Gaussian/reference COM (e.g., rigidly perturbed reference-driven prior).
+- [ ] Add alternative path families and ablation flags.
+- [ ] Add robust weighting / curriculum over time samples.
 
-하지만 너무 많은 핵심 로직을 여기 숨기면 안 된다.
+### `sampler.py`
+- [ ] Add adaptive-step ODE solver option.
+- [ ] Implement UFF/pocket guidance with predictor-corrector stability safeguards.
+- [ ] Add trajectory logging for debugging stiff dynamics.
 
 ```bash
 python -m etflowalign/inference.py \
@@ -304,7 +315,7 @@ python -m etflowalign.inference --help
 - [ ] Add distributed and mixed-precision training support.
 
 ### `inference.py`
-- [ ] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
+- [x] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
 - [ ] Add batch inference over benchmark sets and structured output export.
 - [ ] Add reranking ensemble hooks.
 
@@ -325,6 +336,22 @@ python -m etflowalign.train \
   --save-path etflowalign_ckpt.pt
 ```
 
+### Train (real task batch file)
+
+```bash
+python -m etflowalign.train \
+  --train-data /path/to/train_batch.pt \
+  --val-data /path/to/val_batch.pt \
+  --val-every 20 \
+  --use-scheduler \
+  --save-path etflowalign_ckpt.pt
+```
+
+Real-task `.pt` batch expected keys:
+- required: `query_pos`, `query_atom_type`, `query_batch`, `target_query_pos`
+- optional: `reference_pos`, `reference_atom_type`, `reference_batch`, `pocket_pos`,
+  `query_node_attr`, `reference_node_attr`
+
 ### Inference (from trained checkpoint)
 
 ```bash
@@ -337,3 +364,23 @@ python -m etflowalign.inference \
   --use-pocket-guidance \
   --save-path etflowalign_samples.pt
 ```
+
+### Inference (real task batch file)
+
+```bash
+python -m etflowalign.inference \
+  --checkpoint etflowalign_ckpt.pt \
+  --input-batch /path/to/infer_batch.pt \
+  --num-samples 32 \
+  --top-k 8 \
+  --adaptive-dt \
+  --save-path etflowalign_samples.pt
+```
+
+
+### Ranking backend notes
+
+- `--ranker plugin_combo` (default): combines a TanimotoCombo-like proxy score and docking/physics proxy score.
+- `--ranker legacy_reference_mse`: compatibility mode using the old negative-reference-MSE score.
+- Saved inference artifacts now include `component_scores` (`tanimoto`, `physics`) plus ranker metadata.
+- For production use, inject external plugin callbacks (e.g., ROCS/OpenEye + docking engine) through `PluginRanker`.
