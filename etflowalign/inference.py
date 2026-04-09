@@ -108,7 +108,7 @@ def run_inference(args: argparse.Namespace) -> None:
     if args.use_pocket_guidance:
         batch.pocket_pos = batch.reference_pos + 0.1 * torch.randn_like(batch.reference_pos)
 
-    source_sampler = lambda b: fm.sample_source(b)  # noqa: E731
+    source_sampler = lambda b: fm.sample_inference_source(b)  # noqa: E731
     guidance_fn = make_pocket_pull_guidance(scale=1.0) if args.use_pocket_guidance else None
 
     candidates = generate_candidates(
@@ -165,7 +165,9 @@ def _build_inference_runtime(args: argparse.Namespace, device: torch.device):
         "guidance_scale": args.guidance_scale,
         "guidance_mode": args.guidance_mode,
         "max_guidance_norm": args.max_guidance_norm,
+        "pc_corrector_step_scale": args.pc_corrector_step_scale,
         "adaptive_dt": args.adaptive_dt,
+        "adaptive_dt_max_scale": args.adaptive_dt_max_scale,
         "log_trajectory": args.log_trajectory,
     }
     sampler = ETFlowAlignSampler(model=model, config=ODESamplerConfig(**sampler_args))
@@ -186,7 +188,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--guidance-scale", type=float, default=0.0)
     p.add_argument("--guidance-mode", type=str, default="vector_field", choices=["vector_field", "predictor_corrector"])
     p.add_argument("--max-guidance-norm", type=float, default=5.0)
+    p.add_argument("--pc-corrector-step-scale", type=float, default=1.0)
     p.add_argument("--adaptive-dt", action="store_true")
+    p.add_argument("--adaptive-dt-max-scale", type=float, default=2.0)
     p.add_argument("--log-trajectory", action="store_true")
     p.add_argument("--use-pocket-guidance", action="store_true")
     p.add_argument("--save-path", type=str, default="")

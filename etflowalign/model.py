@@ -13,6 +13,8 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
+from .utils import safe_norm, segment_mean
+
 
 @dataclass
 class AlignmentBatch:
@@ -35,6 +37,8 @@ class AlignmentBatch:
     reference_atom_type: Optional[Tensor] = None
     reference_batch: Optional[Tensor] = None
     pocket_pos: Optional[Tensor] = None
+    query_node_attr: Optional[Tensor] = None
+    reference_node_attr: Optional[Tensor] = None
 
 
 class SimpleTimeEmbedding(nn.Module):
@@ -64,24 +68,6 @@ class SimpleTimeEmbedding(nn.Module):
         if emb.size(-1) < self.dim:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return self.proj(emb)
-
-
-def _segment_mean(x: Tensor, batch: Tensor, num_graphs: int) -> Tensor:
-    """Compute per-graph mean of node features/coordinates.
-
-    Args:
-        x: Node tensor ``[N, D]``.
-        batch: Graph index per node ``[N]``.
-        num_graphs: Number of graphs in the mini-batch.
-
-    Returns:
-        Mean tensor per graph ``[num_graphs, D]``.
-    """
-    out = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
-    cnt = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
-    out.index_add_(0, batch, x)
-    cnt.index_add_(0, batch, torch.ones_like(batch, dtype=x.dtype).unsqueeze(-1))
-    return out / cnt.clamp_min(1.0)
 
 
 def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors: int) -> Tensor:
@@ -174,6 +160,7 @@ class ETFlowAlignModel(nn.Module):
         atom_vocab_size: int = 128,
         hidden_dim: int = 128,
         time_embed_dim: int = 64,
+        extra_feat_dim: int = 0,
         num_blocks: int = 4,
         edge_cutoff: float = 6.0,
         max_neighbors: int = 32,
@@ -185,6 +172,9 @@ class ETFlowAlignModel(nn.Module):
         self.atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
         self.reference_atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
         self.time_embed = SimpleTimeEmbedding(time_embed_dim)
+        self.extra_feat_dim = int(extra_feat_dim)
+        self.query_feat_proj = nn.Linear(self.extra_feat_dim, hidden_dim) if self.extra_feat_dim > 0 else None
+        self.reference_feat_proj = nn.Linear(self.extra_feat_dim, hidden_dim) if self.extra_feat_dim > 0 else None
         # [query_atom, time, ref_dir(3), ref_dist(1), pooled_ref_atom_feat]
         self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4 + hidden_dim, hidden_dim)
 
@@ -216,6 +206,8 @@ class ETFlowAlignModel(nn.Module):
             )
         else:
             ref_atom_feat_all = self.reference_atom_embed(batch.reference_atom_type)
+        if self.reference_feat_proj is not None and batch.reference_node_attr is not None:
+            ref_atom_feat_all = ref_atom_feat_all + self.reference_feat_proj(batch.reference_node_attr)
 
         direction = torch.zeros_like(batch.query_pos)
         distance = torch.zeros(batch.query_pos.size(0), 1, device=batch.query_pos.device, dtype=batch.query_pos.dtype)
@@ -241,7 +233,7 @@ class ETFlowAlignModel(nn.Module):
             rf_anchor = w @ rf
 
             delta = r_anchor - q
-            dist = torch.norm(delta, dim=-1, keepdim=True)
+            dist = safe_norm(delta, dim=-1, keepdim=True)
             direction[q_idx] = delta / dist.clamp_min(1e-8)
             distance[q_idx] = dist
             ref_feat[q_idx] = rf_anchor
@@ -262,10 +254,12 @@ class ETFlowAlignModel(nn.Module):
             return torch.zeros_like(batch.query_pos)
 
         num_graphs = int(batch.query_batch.max().item()) + 1
-        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
+        com = segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
         x = batch.query_pos - com[batch.query_batch]  # Translation-invariant coordinates.
 
         h_atom = self.atom_embed(batch.query_atom_type)  # Atom identity features.
+        if self.query_feat_proj is not None and batch.query_node_attr is not None:
+            h_atom = h_atom + self.query_feat_proj(batch.query_node_attr)
         h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
         ref_dir, ref_dist, ref_feat = self._reference_context(batch)  # Conditioning from reference geometry + atom types.
         h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist, ref_feat], dim=-1))  # Initial node states.

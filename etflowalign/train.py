@@ -113,6 +113,7 @@ def run_training(args: argparse.Namespace) -> None:
         source_type=args.source_type,
         source_noise_scale=args.source_noise_scale,
         time_weighting=args.time_weighting,
+        allow_query_perturbed_for_inference=args.allow_query_perturbed_for_inference,
     )
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
@@ -168,6 +169,7 @@ def run_training(args: argparse.Namespace) -> None:
             "source_type": args.source_type,
             "source_noise_scale": args.source_noise_scale,
             "time_weighting": args.time_weighting,
+            "allow_query_perturbed_for_inference": args.allow_query_perturbed_for_inference,
         },
         "best_val_loss": best_val if val_batch is not None else None,
         "best_model_state": best_state,
@@ -188,9 +190,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=0.05)
-    p.add_argument("--source-type", type=str, default="reference_anchored", choices=["gaussian", "reference_anchored", "query_perturbed"])
+    p.add_argument(
+        "--source-type",
+        type=str,
+        default="reference_anchored",
+        choices=["gaussian", "reference_anchored", "query_perturbed", "rigid_reference_perturbed"],
+    )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--time-weighting", type=str, default="uniform", choices=["uniform", "mid"])
+    p.add_argument("--allow-query-perturbed-for-inference", action="store_true")
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--train-data", type=str, default="", help="Path to torch file for real training batch.")
     p.add_argument("--val-data", type=str, default="", help="Path to torch file for real validation batch.")

@@ -14,6 +14,7 @@ MODE="cuda"       # cpu | cuda
 CUDA_VERSION="12.1"
 INSTALL_UFF="true" # true | false
 UFF_REF="main"     # override with commit hash/tag for reproducibility
+RUN_SMOKE="false"
 
 usage() {
   cat <<USAGE
@@ -25,6 +26,7 @@ Options:
   --cuda-version <version>  CUDA version for pytorch-cuda (default: 12.1)
   --no-uff                  Skip UFF_PyTorch installation
   --uff-ref <ref>           UFF_PyTorch git ref (commit/tag/branch; default: main)
+  --smoke-test              Run a post-install import smoke test
   -h, --help                Show this message
 USAGE
 }
@@ -41,6 +43,8 @@ while [[ $# -gt 0 ]]; do
       INSTALL_UFF="false"; shift ;;
     --uff-ref)
       UFF_REF="$2"; shift 2 ;;
+    --smoke-test)
+      RUN_SMOKE="true"; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -94,3 +98,13 @@ fi
 echo "[setup] done"
 echo "[setup] activate with: conda activate ${ENV_NAME}"
 echo "[setup] smoke test: python -m etflowalign.train --help"
+
+if [[ "$RUN_SMOKE" == "true" ]]; then
+  echo "[setup] running smoke test imports"
+  conda run -n "${ENV_NAME}" python - <<'PY'
+import torch
+import etflowalign
+print("torch:", torch.__version__)
+print("etflowalign exports:", etflowalign.__all__)
+PY
+fi

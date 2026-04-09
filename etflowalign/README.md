@@ -81,6 +81,13 @@ cd etflowalign
 bash setup_env.sh --mode cuda --uff-ref <commit_or_tag>
 ```
 
+Optional post-install smoke test:
+
+```bash
+cd etflowalign
+bash setup_env.sh --mode cpu --smoke-test
+```
+
 Then run scripts from repository root (or with `python -m ...` from root):
 
 ```bash

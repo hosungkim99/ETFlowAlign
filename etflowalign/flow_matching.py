@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .model import AlignmentBatch, ETFlowAlignModel
+from .utils import segment_mean
 
 
 @dataclass
@@ -23,10 +24,11 @@ class FlowMatchingConfig:
     """
 
     sigma: float = 0.05
-    source_type: Literal["gaussian", "reference_anchored", "query_perturbed"] = "reference_anchored"
+    source_type: Literal["gaussian", "reference_anchored", "query_perturbed", "rigid_reference_perturbed"] = "reference_anchored"
     source_noise_scale: float = 0.5
     time_eps: float = 1e-4
     time_weighting: Literal["uniform", "mid"] = "uniform"
+    allow_query_perturbed_for_inference: bool = False
 
 
 class AlignmentFlowMatcher:
@@ -62,32 +64,75 @@ class AlignmentFlowMatcher:
             - gaussian: isotropic Gaussian source.
             - query_perturbed: perturb target with Gaussian noise.
             - reference_anchored: sample around reference center of mass.
+            - rigid_reference_perturbed: rigid perturb reference pose (alignment-aware prior).
         """
         stype = self.config.source_type
         if stype == "gaussian":
             return torch.randn_like(batch.query_pos)
 
         if stype == "query_perturbed" and target_query_pos is not None:
+            # NOTE: primarily for training ablation; not a pure generative prior.
             return target_query_pos + self.config.source_noise_scale * torch.randn_like(target_query_pos)
+
+        if stype == "rigid_reference_perturbed":
+            rigid = self._rigid_reference_prior(batch)
+            if rigid is not None:
+                return rigid + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
 
         # reference_anchored fallback
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
             return torch.randn_like(batch.query_pos)
 
         num_graphs = int(batch.reference_batch.max().item()) + 1
-        center = torch.zeros(num_graphs, 3, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
-        count = torch.zeros(num_graphs, 1, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
-        center.index_add_(0, batch.reference_batch, batch.reference_pos)
-        count.index_add_(0, batch.reference_batch, torch.ones_like(batch.reference_batch, dtype=batch.reference_pos.dtype).unsqueeze(-1))
-        center = center / count.clamp_min(1.0)
+        center = segment_mean(batch.reference_pos, batch.reference_batch, num_graphs)
         return center[batch.query_batch] + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
+
+    def sample_inference_source(self, batch: AlignmentBatch) -> Tensor:
+        """Sample source for inference-time generation.
+
+        Prevents accidentally using query_perturbed prior during true generation.
+        """
+        if self.config.source_type == "query_perturbed" and not self.config.allow_query_perturbed_for_inference:
+            backup = FlowMatchingConfig(
+                sigma=self.config.sigma,
+                source_type="reference_anchored",
+                source_noise_scale=self.config.source_noise_scale,
+                time_eps=self.config.time_eps,
+                time_weighting=self.config.time_weighting,
+                allow_query_perturbed_for_inference=self.config.allow_query_perturbed_for_inference,
+            )
+            return AlignmentFlowMatcher(backup).sample_source(batch=batch, target_query_pos=None)
+        return self.sample_source(batch=batch, target_query_pos=None)
+
+    def _rigid_reference_prior(self, batch: AlignmentBatch) -> Tensor | None:
+        """Alignment-aware prior via per-graph rigid perturbation of reference coordinates."""
+        if batch.reference_pos is None or batch.reference_batch is None:
+            return None
+        if batch.query_pos.size(0) != batch.reference_pos.size(0):
+            return None
+        if not torch.equal(batch.query_batch, batch.reference_batch):
+            return None
+
+        x0 = torch.zeros_like(batch.query_pos)
+        num_graphs = int(batch.query_batch.max().item()) + 1
+        for g in range(num_graphs):
+            idx = torch.where(batch.query_batch == g)[0]
+            ref = batch.reference_pos[idx]
+            com = ref.mean(dim=0, keepdim=True)
+            centered = ref - com
+            q, _ = torch.linalg.qr(torch.randn(3, 3, device=ref.device, dtype=ref.dtype))
+            if torch.det(q) < 0:
+                q[:, -1] *= -1
+            trans = torch.randn(1, 3, device=ref.device, dtype=ref.dtype) * self.config.source_noise_scale
+            x0[idx] = centered @ q.T + com + trans
+        return x0
 
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         """Construct noisy path state and vector-field regression target.
 
         Args:
             batch: Input batch containing conditioning information.
-            target_query_pos: Ground-truth aligned query positions ``x1``.
+            target_query_pos: Ground-truth aligned query positions ``x1`` (already aligned target).
             t_graph: Time per graph ``[B]``.
 
         Returns:
