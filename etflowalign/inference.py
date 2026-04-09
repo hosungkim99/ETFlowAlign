@@ -15,15 +15,15 @@ from torch import Tensor
 
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
 from .model import AlignmentBatch, ETFlowAlignModel
+from .rankers import LegacyReferenceMseRanker, PluginRanker, RankerConfig
 from .sampler import ETFlowAlignSampler, GuidanceFn, ODESamplerConfig
 from .train import load_alignment_batch_from_pt, make_synthetic_alignment_batch
-
-RankFn = Callable[[Tensor, AlignmentBatch], Tensor]
 
 
 @dataclass
 class InferenceConfig:
     """Minimal inference configuration container."""
+
     num_samples: int = 8
 
 
@@ -51,28 +51,20 @@ def generate_candidates(
     return torch.stack(outputs, dim=0)
 
 
-def reference_fit_ranker(candidates: Tensor, batch: AlignmentBatch) -> Tensor:
-    """Simple ranking adapter: negative MSE to reference positions per candidate.
-
-    In real usage this should be replaced with docking/ranking metrics such as
-    TanimotoCombo + pocket-aware scores.
-    """
-    if batch.reference_pos is None:
-        return torch.zeros(candidates.size(0), device=candidates.device)
-
-    diff = candidates - batch.reference_pos.unsqueeze(0)
-    mse = (diff * diff).mean(dim=(1, 2))
-    return -mse
-
-
-def rank_candidates(candidates: Tensor, batch: AlignmentBatch, rank_fn: Optional[RankFn] = None) -> tuple[Tensor, Tensor]:
-    """Rank candidates in descending score order."""
-    if rank_fn is None:
-        scores = reference_fit_ranker(candidates, batch)
-    else:
-        scores = rank_fn(candidates, batch)
-    order = torch.argsort(scores, descending=True)
-    return candidates[order], scores[order]
+def rank_candidates(
+    candidates: Tensor,
+    batch: AlignmentBatch,
+    ranker: Optional[PluginRanker | LegacyReferenceMseRanker] = None,
+) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+    """Rank candidates in descending score order with component breakdown."""
+    ranker = ranker or PluginRanker()
+    breakdown = ranker.score(candidates, batch)
+    order = torch.argsort(breakdown.total, descending=True)
+    components = {
+        "tanimoto": breakdown.tanimoto[order],
+        "physics": breakdown.physics[order],
+    }
+    return candidates[order], breakdown.total[order], components
 
 
 def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
@@ -118,10 +110,12 @@ def run_inference(args: argparse.Namespace) -> None:
         guidance_fn=guidance_fn,
         num_samples=args.num_samples,
     )
-    ranked, scores = rank_candidates(candidates=candidates, batch=batch)
+    ranker = _build_ranker(args)
+    ranked, scores, components = rank_candidates(candidates=candidates, batch=batch, ranker=ranker)
     if args.top_k > 0:
         ranked = ranked[: args.top_k]
         scores = scores[: args.top_k]
+        components = {k: v[: args.top_k] for k, v in components.items()}
 
     print(f"[inference] candidates={candidates.shape}")
     print(f"[inference] top_score={scores[0].item():.6f}")
@@ -131,12 +125,20 @@ def run_inference(args: argparse.Namespace) -> None:
             {
                 "candidates": ranked.cpu(),
                 "scores": scores.cpu(),
+                "component_scores": {k: v.cpu() for k, v in components.items()},
                 "metadata": {
                     "checkpoint": args.checkpoint,
                     "model_args": model_args,
                     "flow_args": flow_args,
                     "sampler_args": sampler_args,
+                    "source_policy": flow_args.get("source_type", "reference_anchored"),
+                    "input_batch_path": args.input_batch if args.input_batch else None,
+                    "input_has_query_node_attr": bool(batch.query_node_attr is not None),
+                    "input_has_reference_node_attr": bool(batch.reference_node_attr is not None),
                     "guidance_used": bool(args.use_pocket_guidance and args.guidance_scale > 0.0),
+                    "ranker": args.ranker,
+                    "tanimoto_weight": args.tanimoto_weight,
+                    "physics_weight": args.physics_weight,
                     "num_samples": args.num_samples,
                     "top_k": args.top_k,
                     "n_atoms": args.n_atoms,
@@ -146,6 +148,21 @@ def run_inference(args: argparse.Namespace) -> None:
             args.save_path,
         )
         print(f"[inference] saved to: {args.save_path}")
+
+
+def _build_ranker(args: argparse.Namespace) -> PluginRanker | LegacyReferenceMseRanker:
+    """Build ranking backend from CLI options."""
+    if args.ranker == "legacy_reference_mse":
+        return LegacyReferenceMseRanker()
+
+    config = RankerConfig(
+        tanimoto_weight=args.tanimoto_weight,
+        physics_weight=args.physics_weight,
+        shape_sigma=args.shape_sigma,
+        clash_cutoff=args.clash_cutoff,
+        clash_penalty_weight=args.clash_penalty_weight,
+    )
+    return PluginRanker(config=config)
 
 
 def _build_inference_runtime(args: argparse.Namespace, device: torch.device):
@@ -184,6 +201,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--top-k", type=int, default=0, help="If >0, keep only top-k ranked candidates.")
+    p.add_argument("--ranker", type=str, default="plugin_combo", choices=["plugin_combo", "legacy_reference_mse"])
+    p.add_argument("--tanimoto-weight", type=float, default=1.0)
+    p.add_argument("--physics-weight", type=float, default=1.0)
+    p.add_argument("--shape-sigma", type=float, default=1.2)
+    p.add_argument("--clash-cutoff", type=float, default=1.0)
+    p.add_argument("--clash-penalty-weight", type=float, default=2.0)
     p.add_argument("--n-atoms", type=int, default=16)
     p.add_argument("--n-steps", type=int, default=64)
     p.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"])
