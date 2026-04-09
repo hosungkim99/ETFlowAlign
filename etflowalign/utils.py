@@ -19,7 +19,6 @@ def center_by_batch(x: Tensor, batch: Tensor) -> Tensor:
     Returns:
         Centered tensor with per-graph mean removed.
     """
-    """Subtract per-graph mean coordinates."""
     num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
     if num_graphs == 0:
         return x
