@@ -40,6 +40,8 @@ def load_alignment_batch_from_pt(path: str, device: torch.device) -> tuple[Align
         reference_atom_type=payload.get("reference_atom_type", None).to(device) if payload.get("reference_atom_type", None) is not None else None,
         reference_batch=payload.get("reference_batch", None).to(device) if payload.get("reference_batch", None) is not None else None,
         pocket_pos=payload.get("pocket_pos", None).to(device) if payload.get("pocket_pos", None) is not None else None,
+        query_node_attr=payload.get("query_node_attr", None).to(device) if payload.get("query_node_attr", None) is not None else None,
+        reference_node_attr=payload.get("reference_node_attr", None).to(device) if payload.get("reference_node_attr", None) is not None else None,
     )
     target = payload["target_query_pos"].to(device)
     return batch, target
@@ -106,7 +108,14 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 def run_training(args: argparse.Namespace) -> None:
     """Entry point used by CLI: train on synthetic data and save checkpoint."""
     device = torch.device(args.device)
-    model = ETFlowAlignModel(hidden_dim=args.hidden_dim, num_blocks=args.num_blocks).to(device)
+    model = ETFlowAlignModel(
+        hidden_dim=args.hidden_dim,
+        num_blocks=args.num_blocks,
+        time_embed_dim=args.time_embed_dim,
+        edge_cutoff=args.edge_cutoff,
+        max_neighbors=args.max_neighbors,
+        extra_feat_dim=args.extra_feat_dim,
+    ).to(device)
 
     fm_config = FlowMatchingConfig(
         sigma=args.sigma,
@@ -157,6 +166,10 @@ def run_training(args: argparse.Namespace) -> None:
         "model_args": {
             "hidden_dim": args.hidden_dim,
             "num_blocks": args.num_blocks,
+            "time_embed_dim": args.time_embed_dim,
+            "edge_cutoff": args.edge_cutoff,
+            "max_neighbors": args.max_neighbors,
+            "extra_feat_dim": args.extra_feat_dim,
         },
         "train_config": {
             "lr": args.lr,
@@ -187,6 +200,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-atoms", type=int, default=16)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--num-blocks", type=int, default=4)
+    p.add_argument("--time-embed-dim", type=int, default=64)
+    p.add_argument("--edge-cutoff", type=float, default=6.0)
+    p.add_argument("--max-neighbors", type=int, default=32)
+    p.add_argument("--extra-feat-dim", type=int, default=0, help="Feature dim for optional query/reference node attributes.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=0.05)

@@ -162,6 +162,11 @@ python -m etflowalign.train \
   --save-path etflowalign_ckpt.pt
 ```
 
+Real-task `.pt` batch expected keys:
+- required: `query_pos`, `query_atom_type`, `query_batch`, `target_query_pos`
+- optional: `reference_pos`, `reference_atom_type`, `reference_batch`, `pocket_pos`,
+  `query_node_attr`, `reference_node_attr`
+
 ### Inference (from trained checkpoint)
 
 ```bash
