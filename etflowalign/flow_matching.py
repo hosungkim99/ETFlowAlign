@@ -77,7 +77,7 @@ class AlignmentFlowMatcher:
         if stype == "rigid_reference_perturbed":
             rigid = self._rigid_reference_prior(batch)
             if rigid is not None:
-                return rigid + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
+                return rigid
 
         # reference_anchored fallback
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:

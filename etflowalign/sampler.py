@@ -39,8 +39,10 @@ class ODESamplerConfig:
     max_guidance_norm: float = 5.0
     pc_corrector_step_scale: float = 1.0
     adaptive_dt: bool = False
+    adaptive_dt_min_scale: float = 0.1
     adaptive_dt_max_scale: float = 2.0
     log_trajectory: bool = False
+    max_trace_steps: int = 2000
 
 
 class ETFlowAlignSampler:
@@ -142,7 +144,10 @@ class ETFlowAlignSampler:
             if self.config.adaptive_dt:
                 v_norm = torch.norm(v, dim=-1).mean().clamp_min(1e-8)
                 dt_eff = dt / v_norm
-                dt_eff = dt_eff.clamp(min=0.0, max=float(dt) * self.config.adaptive_dt_max_scale)
+                dt_eff = dt_eff.clamp(
+                    min=float(dt) * self.config.adaptive_dt_min_scale,
+                    max=float(dt) * self.config.adaptive_dt_max_scale,
+                )
 
             if self.config.solver == "euler":
                 x = x + dt_eff * v
@@ -161,7 +166,7 @@ class ETFlowAlignSampler:
             if not torch.isfinite(x).all():
                 raise FloatingPointError("Non-finite coordinates during ODE integration. Reduce guidance scale.")
 
-            if self.config.log_trajectory:
+            if self.config.log_trajectory and len(self.last_trace) < self.config.max_trace_steps:
                 self.last_trace.append(
                     {
                         "step": float(i),

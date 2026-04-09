@@ -177,6 +177,11 @@ class ETFlowAlignModel(nn.Module):
         self.reference_feat_proj = nn.Linear(self.extra_feat_dim, hidden_dim) if self.extra_feat_dim > 0 else None
         # [query_atom, time, ref_dir(3), ref_dist(1), pooled_ref_atom_feat]
         self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4 + hidden_dim, hidden_dim)
+        self.block_condition = nn.Sequential(
+            nn.Linear(hidden_dim + 4, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
         self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
         # More expressive equivariant head than v = gate * x:
@@ -240,6 +245,25 @@ class ETFlowAlignModel(nn.Module):
 
         return direction, distance, ref_feat
 
+    def _validate_optional_features(self, batch: AlignmentBatch) -> None:
+        """Validate optional chemistry feature tensors for safe usage."""
+        if batch.query_node_attr is not None:
+            if batch.query_node_attr.size(0) != batch.query_pos.size(0):
+                raise ValueError("query_node_attr first dimension must match query_pos.")
+            if self.query_feat_proj is None:
+                raise ValueError("query_node_attr provided but model.extra_feat_dim == 0.")
+            if batch.query_node_attr.size(-1) != self.extra_feat_dim:
+                raise ValueError(f"query_node_attr feature dim must be {self.extra_feat_dim}.")
+        if batch.reference_node_attr is not None:
+            if batch.reference_pos is None:
+                raise ValueError("reference_node_attr provided but reference_pos is None.")
+            if batch.reference_node_attr.size(0) != batch.reference_pos.size(0):
+                raise ValueError("reference_node_attr first dimension must match reference_pos.")
+            if self.reference_feat_proj is None:
+                raise ValueError("reference_node_attr provided but model.extra_feat_dim == 0.")
+            if batch.reference_node_attr.size(-1) != self.extra_feat_dim:
+                raise ValueError(f"reference_node_attr feature dim must be {self.extra_feat_dim}.")
+
     def forward(self, batch: AlignmentBatch, t_graph: Tensor) -> Tensor:
         """Predict query velocity field ``v_theta(x_t, t, cond)``.
 
@@ -252,6 +276,7 @@ class ETFlowAlignModel(nn.Module):
         """
         if batch.query_pos.numel() == 0:
             return torch.zeros_like(batch.query_pos)
+        self._validate_optional_features(batch)
 
         num_graphs = int(batch.query_batch.max().item()) + 1
         com = segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
@@ -265,7 +290,10 @@ class ETFlowAlignModel(nn.Module):
         h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist, ref_feat], dim=-1))  # Initial node states.
 
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
+        cond_block = self.block_condition(torch.cat([ref_feat, ref_dir, ref_dist], dim=-1))
         for block in self.blocks:
+            # Re-inject conditioning at every message-passing block (not only at input concat).
+            h = h + cond_block
             h, x = block(h, x, edge_index)
 
         scale_x = self.out_scale_x(h)

@@ -18,6 +18,9 @@ __all__ = [
     "FlowMatchingConfig",
     "ODESamplerConfig",
     "TrainConfig",
+    "build_training_components",
+    "flow_matching_step",
     "generate_candidates",
     "rank_candidates",
+    "train_step",
 ]

@@ -167,8 +167,10 @@ def _build_inference_runtime(args: argparse.Namespace, device: torch.device):
         "max_guidance_norm": args.max_guidance_norm,
         "pc_corrector_step_scale": args.pc_corrector_step_scale,
         "adaptive_dt": args.adaptive_dt,
+        "adaptive_dt_min_scale": args.adaptive_dt_min_scale,
         "adaptive_dt_max_scale": args.adaptive_dt_max_scale,
         "log_trajectory": args.log_trajectory,
+        "max_trace_steps": args.max_trace_steps,
     }
     sampler = ETFlowAlignSampler(model=model, config=ODESamplerConfig(**sampler_args))
     return ckpt, model_args, flow_args, sampler_args, sampler, fm
@@ -190,8 +192,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-guidance-norm", type=float, default=5.0)
     p.add_argument("--pc-corrector-step-scale", type=float, default=1.0)
     p.add_argument("--adaptive-dt", action="store_true")
+    p.add_argument("--adaptive-dt-min-scale", type=float, default=0.1)
     p.add_argument("--adaptive-dt-max-scale", type=float, default=2.0)
     p.add_argument("--log-trajectory", action="store_true")
+    p.add_argument("--max-trace-steps", type=int, default=2000)
     p.add_argument("--use-pocket-guidance", action="store_true")
     p.add_argument("--save-path", type=str, default="")
     return p
