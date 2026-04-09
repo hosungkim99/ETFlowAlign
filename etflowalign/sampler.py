@@ -66,7 +66,7 @@ class ETFlowAlignSampler:
         )
         return self.model(cur, t_graph=t_graph)
 
-    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> Tensor:
+    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> tuple[Tensor, Tensor]:
         """Apply optional external guidance based on configured mode.
 
         Returns:
