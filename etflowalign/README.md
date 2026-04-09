@@ -1,3 +1,4 @@
+# ETFlowAlign
 Start here:
 1. `model.py` for the overall architecture
 2. `flow_matching.py` for the training objective
@@ -187,83 +188,152 @@ Start here:
 2. `flow_matching.py` for the training objective
 3. `sampler.py` for inference dynamics
 
-## flow_matching.py
+ETFlowAlign is a **flow-matching re-design of DiffAlign** for flexible molecular alignment.
 
-여기에는:
+It preserves DiffAlign's task contract (query ligand alignment conditioned on a reference ligand and optional pocket context) while replacing diffusion-style denoising dynamics with an ET-Flow-style time-dependent vector field and ODE sampling.
 
-ET-Flow 기반 objective
+---
 
-path definition
+## Design summary
 
-velocity target
+```text
+ETFlowAlign = DiffAlign task framework
+            - diffusion reverse process (DDPM/DDIM-style)
+            + flow matching objective + ODE integration
+```
 
-time sampling
+### Preserved from DiffAlign
 
-training target 생성
+1. Query ligand alignment task under reference context.
+2. Reference-conditioned generation setup.
+3. Direct Cartesian coordinate generation.
+4. Equivariant vector-field output contract.
+5. Pocket-aware guidance as an inference-time steering signal.
+6. Multi-sample generation + ranking compatibility.
 
-을 넣는다.
+### Imported from ET-Flow
 
-즉 diffusion loss를 대체하는 수학적 핵심을 둔다.
+1. Flow-matching vector-field regression objective.
+2. Continuous-time vector field `v_theta(x_t, t, cond)`.
+3. Interpolation probability path between source and target states.
+4. ODE solver-based sampling.
 
+---
 
-## inference.py
-여기에는:
+## File guide
 
-inference entry point
+Read in this order:
 
-evaluation/inference pipeline
+1. `model.py` – equivariant vector-field model
+2. `flow_matching.py` – path/source/target and training objective
+3. `sampler.py` – ODE integration and guidance injection
+4. `train.py` – runnable training script (synthetic demo)
+5. `inference.py` – runnable inference script + ranking adapter
 
-를 둔다.
+`utils.py` remains intentionally lightweight.
 
+---
 
-## model.py
-가장 중요하다.
+## Environment setup
 
-여기에는:
+`etflowalign/` now includes its own environment file:
 
-ETFlowAlign 전체 모델 구조
+- `env.yml` (Conda environment for ETFlowAlign scripts)
+- `setup_env.sh` (CPU/CUDA-aware setup script)
 
-DiffAlign에서 유지한 부분
+The environment specification was assembled by referencing:
 
-ET-Flow로 바꾼 부분
+- `external/diffalign/diffalign/env.yml`
+- `external/etflow/env.yml`
 
-forward 흐름
+Create and activate:
 
-을 넣는다.
+```bash
+cd etflowalign
+bash setup_env.sh --mode cuda
+conda activate etflowalign
+```
 
-이 파일 하나만 봐도
-“아, 이 모델이 어떻게 생겼는지”
-알 수 있어야 한다.
+CPU-only install:
 
-## sampler.py
-여기에는:
+```bash
+cd etflowalign
+bash setup_env.sh --mode cpu
+conda activate etflowalign
+```
 
-inference / generation / integration loop
+Then run scripts from repository root (or with `python -m ...` from root):
 
-Euler / ODE step
+```bash
+python -m etflowalign.train --help
+python -m etflowalign.inference --help
+```
 
-iterative update
+---
 
-를 둔다.
+## Review points: current scaffold limitations
 
-즉 “학습된 flow를 가지고 실제로 어떻게 샘플을 얻는가”를 정리한다.
+1. **Backbone simplification**: uses a compact EGNN-style block, but not yet a full production molecular transformer.
+2. **Synthetic data only**: training/inference scripts currently run on synthetic alignment batches for smoke testing.
+3. **Guidance placeholder**: pocket guidance is provided as a safe hook with clipping, not yet full UFF physics integration.
+4. **Ranking placeholder**: ranking adapter defaults to a simple geometric score instead of production metrics (e.g., TanimotoCombo + docking score).
+5. **No benchmark pipeline yet**: dataset preprocessing/evaluation scripts for real alignment benchmarks are pending.
 
+---
 
-## train.py
-여기에는:
+## Next-commit concrete checklist (per file)
 
-training step
+### `model.py`
+- [ ] Replace compact EGNN-style block with a stronger E(3)-equivariant transformer-style backbone.
+- [ ] Add richer conditioning channels (reference atom features, cross-graph attention).
+- [ ] Add optional chirality-aware auxiliary head.
 
-loss 호출
+### `flow_matching.py`
+- [ ] Add alignment-aware source distributions beyond Gaussian/reference COM (e.g., rigidly perturbed reference-driven prior).
+- [ ] Add alternative path families and ablation flags.
+- [ ] Add robust weighting / curriculum over time samples.
 
-optimizer step
+### `sampler.py`
+- [ ] Add adaptive-step ODE solver option.
+- [ ] Implement UFF/pocket guidance with predictor-corrector stability safeguards.
+- [ ] Add trajectory logging for debugging stiff dynamics.
 
-batch 처리
+### `train.py`
+- [ ] Replace synthetic batch generator with real dataset/datamodule.
+- [ ] Add validation loop and checkpoint-by-metric selection.
+- [ ] Add distributed and mixed-precision training support.
 
-를 둔다.
+### `inference.py`
+- [ ] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
+- [ ] Add batch inference over benchmark sets and structured output export.
+- [ ] Add reranking ensemble hooks.
 
-## utils.py
-공통 유틸은 여기에 모은다.
+### `utils.py`
+- [ ] Keep only non-core helpers; avoid moving algorithmic logic here.
 
-하지만 너무 많은 핵심 로직을 여기 숨기면 안 된다.
+---
 
+## Runnable scripts
+
+### Train (synthetic smoke test)
+
+```bash
+python -m etflowalign.train \
+  --steps 200 \
+  --batch-size 8 \
+  --n-atoms 16 \
+  --save-path etflowalign_ckpt.pt
+```
+
+### Inference (from trained checkpoint)
+
+```bash
+python -m etflowalign.inference \
+  --checkpoint etflowalign_ckpt.pt \
+  --num-samples 16 \
+  --n-steps 64 \
+  --solver heun \
+  --guidance-scale 0.2 \
+  --use-pocket-guidance \
+  --save-path etflowalign_samples.pt
+```

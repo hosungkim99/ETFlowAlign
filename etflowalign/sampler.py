@@ -15,6 +15,17 @@ GuidanceFn = Callable[[AlignmentBatch, Tensor, Tensor], Tensor]
 
 @dataclass
 class ODESamplerConfig:
+    """Configuration for ODE inference.
+
+    Attributes:
+        n_steps: Number of integration steps from t_start to t_end.
+        t_start: Initial integration time.
+        t_end: Final integration time.
+        solver: Numerical solver (Euler or Heun).
+        guidance_scale: Global multiplier for external guidance.
+        guidance_mode: How guidance is injected.
+        max_guidance_norm: Per-atom norm cap for guidance vectors.
+    """
     n_steps: int = 50
     t_start: float = 0.0
     t_end: float = 1.0
@@ -33,14 +44,17 @@ class ETFlowAlignSampler:
     """
 
     def __init__(self, model: ETFlowAlignModel, config: ODESamplerConfig) -> None:
+        """Bind trained model and sampling hyperparameters."""
         self.model = model
         self.config = config
 
     def _clip_guidance(self, g: Tensor) -> Tensor:
+        """Clip guidance vectors by L2 norm for numerical stability."""
         norm = torch.norm(g, dim=-1, keepdim=True).clamp_min(1e-8)
         return g * (self.config.max_guidance_norm / norm).clamp(max=1.0)
 
     def _model_v(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor) -> Tensor:
+        """Evaluate model velocity at state x and time t."""
         cur = AlignmentBatch(
             query_pos=x,
             query_atom_type=batch.query_atom_type,
@@ -53,6 +67,11 @@ class ETFlowAlignSampler:
         return self.model(cur, t_graph=t_graph)
 
     def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> Tensor:
+        """Apply optional external guidance based on configured mode.
+
+        Returns:
+            Tuple ``(x, v)`` after guidance adjustment.
+        """
         if guidance_fn is None or self.config.guidance_scale <= 0.0:
             return x, v
 
@@ -76,6 +95,16 @@ class ETFlowAlignSampler:
 
     @torch.no_grad()
     def sample(self, batch: AlignmentBatch, x0: Tensor, guidance_fn: Optional[GuidanceFn] = None) -> Tensor:
+        """Integrate ODE from source state to final aligned state.
+
+        Args:
+            batch: Conditioning batch.
+            x0: Initial query coordinates.
+            guidance_fn: Optional external guidance callback.
+
+        Returns:
+            Final query coordinates after ODE integration.
+        """
         num_graphs = int(batch.query_batch.max().item()) + 1
         t_grid = torch.linspace(self.config.t_start, self.config.t_end, self.config.n_steps + 1, device=x0.device)
 

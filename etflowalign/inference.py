@@ -23,6 +23,7 @@ RankFn = Callable[[Tensor, AlignmentBatch], Tensor]
 
 @dataclass
 class InferenceConfig:
+    """Minimal inference configuration container."""
     num_samples: int = 8
 
 
@@ -33,6 +34,15 @@ def generate_candidates(
     guidance_fn: Optional[GuidanceFn] = None,
     num_samples: int = 8,
 ) -> Tensor:
+    """Generate aligned query candidates as ``[num_samples, N, 3]``.
+
+    Args:
+        sampler: ODE sampler.
+        batch: Conditioning batch.
+        source_sampler: Callback generating initial coordinates ``x0``.
+        guidance_fn: Optional guidance callback.
+        num_samples: Number of candidates to generate.
+    """
     """Generate aligned query candidates as [num_samples, N, 3]."""
     outputs = []
     for _ in range(num_samples):
@@ -57,6 +67,7 @@ def reference_fit_ranker(candidates: Tensor, batch: AlignmentBatch) -> Tensor:
 
 
 def rank_candidates(candidates: Tensor, batch: AlignmentBatch, rank_fn: Optional[RankFn] = None) -> tuple[Tensor, Tensor]:
+    """Rank candidates in descending score order."""
     if rank_fn is None:
         scores = reference_fit_ranker(candidates, batch)
     else:
@@ -69,6 +80,13 @@ def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
     """Create a toy pocket guidance: pull query toward pocket center if available."""
 
     def _guidance(batch: AlignmentBatch, t_graph: Tensor, v: Tensor) -> Tensor:
+        """Guidance callback used by sampler.
+
+        Variables:
+            batch: Current sampler batch/state.
+            t_graph: Current time per graph.
+            v: Current model velocity prediction.
+        """
         if batch.pocket_pos is None or batch.pocket_pos.numel() == 0:
             return torch.zeros_like(v)
         pocket_center = batch.pocket_pos.mean(dim=0, keepdim=True)
@@ -79,6 +97,12 @@ def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
 
 
 def run_inference(args: argparse.Namespace) -> None:
+    """CLI inference routine: load checkpoint, sample, rank, and optionally save."""
+    device = torch.device(args.device)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    model_args = ckpt.get("model_args", {})  # Model architecture params saved during training.
+    flow_args = ckpt.get("flow_args", {})  # Flow matcher params for source sampling consistency.
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
 
@@ -127,6 +151,7 @@ def run_inference(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    """Define CLI arguments for inference script."""
     p = argparse.ArgumentParser(description="Run ETFlowAlign inference on synthetic demo data.")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--device", type=str, default="cpu")
@@ -143,6 +168,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI main."""
     args = build_argparser().parse_args()
     run_inference(args)
 

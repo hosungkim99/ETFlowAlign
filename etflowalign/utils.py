@@ -10,6 +10,15 @@ from torch import Tensor
 
 
 def center_by_batch(x: Tensor, batch: Tensor) -> Tensor:
+    """Subtract per-graph mean coordinates.
+
+    Args:
+        x: Coordinate/feature tensor ``[N, D]``.
+        batch: Graph id per row ``[N]``.
+
+    Returns:
+        Centered tensor with per-graph mean removed.
+    """
     """Subtract per-graph mean coordinates."""
     num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
     if num_graphs == 0:

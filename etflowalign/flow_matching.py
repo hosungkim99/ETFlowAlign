@@ -13,6 +13,14 @@ from .model import AlignmentBatch, ETFlowAlignModel
 
 @dataclass
 class FlowMatchingConfig:
+    """Configuration for alignment-specific flow matching.
+
+    Attributes:
+        sigma: Noise scale used in the interpolating probability path.
+        source_type: Strategy for source state ``x0``.
+        source_noise_scale: Noise amount for source samplers.
+        time_eps: Numerical margin to avoid exactly 0/1 time values.
+    """
     """Configuration for alignment-specific flow matching."""
 
     sigma: float = 0.05
@@ -31,6 +39,19 @@ class AlignmentFlowMatcher:
     """
 
     def __init__(self, config: FlowMatchingConfig) -> None:
+        """Store flow-matching hyperparameters."""
+        self.config = config
+
+    def sample_time(self, num_graphs: int, device: torch.device) -> Tensor:
+        """Uniformly sample training times for each graph in a batch."""
+        return torch.empty(num_graphs, device=device).uniform_(self.config.time_eps, 1.0 - self.config.time_eps)
+
+    def sigma_t(self, t_node: Tensor) -> Tensor:
+        """Compute path noise scale ``sigma(t)`` at node-expanded times."""
+        return self.config.sigma * torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
+
+    def sigma_dot_t(self, t_node: Tensor) -> Tensor:
+        """Compute derivative ``d sigma(t) / dt`` used in target vector field."""
         self.config = config
 
     def sample_time(self, num_graphs: int, device: torch.device) -> Tensor:
@@ -44,6 +65,13 @@ class AlignmentFlowMatcher:
         return self.config.sigma * 0.5 * (1.0 - 2.0 * t_node) / denom
 
     def sample_source(self, batch: AlignmentBatch, target_query_pos: Tensor | None = None) -> Tensor:
+        """Sample source state ``x0`` for flow matching.
+
+        Modes:
+            - gaussian: isotropic Gaussian source.
+            - query_perturbed: perturb target with Gaussian noise.
+            - reference_anchored: sample around reference center of mass.
+        """
         stype = self.config.source_type
         if stype == "gaussian":
             return torch.randn_like(batch.query_pos)
@@ -64,6 +92,17 @@ class AlignmentFlowMatcher:
         return center[batch.query_batch] + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
 
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
+        """Construct noisy path state and vector-field regression target.
+
+        Args:
+            batch: Input batch containing conditioning information.
+            target_query_pos: Ground-truth aligned query positions ``x1``.
+            t_graph: Time per graph ``[B]``.
+
+        Returns:
+            x_t: Interpolated noisy states at sampled time.
+            u_t: Target velocity vectors for flow matching.
+        """
         t_node = t_graph[batch.query_batch]
         x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
         eps = torch.randn_like(target_query_pos)
@@ -75,6 +114,7 @@ class AlignmentFlowMatcher:
         return x_t, u_t
 
     def loss(self, pred_v: Tensor, target_u: Tensor, batch_index: Tensor) -> Tensor:
+        """Compute per-graph averaged MSE over vector fields."""
         per_atom = ((pred_v - target_u) ** 2).sum(dim=-1)
         num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 0
         if num_graphs == 0:
@@ -93,6 +133,14 @@ def flow_matching_step(
     batch: AlignmentBatch,
     target_query_pos: Tensor,
 ) -> Tensor:
+    """Single ETFlowAlign flow-matching training step.
+
+    This helper performs:
+        1) time sampling,
+        2) path/target construction,
+        3) model forward on ``x_t``,
+        4) vector-field regression loss.
+    """
     """Single ETFlowAlign flow-matching training step."""
     num_graphs = int(batch.query_batch.max().item()) + 1
     t_graph = matcher.sample_time(num_graphs=num_graphs, device=batch.query_pos.device)
