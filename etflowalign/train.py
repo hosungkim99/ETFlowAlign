@@ -62,6 +62,15 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 
     # Construct alignment target from reference with global transform + local deformation.
     t = torch.randn(batch_size, 3, device=device) * 0.25  # Per-graph translation.
+    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)
+    reference_batch = query_batch.clone()
+
+    # Base molecular-like cloud around origin per graph.
+    ref = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)
+    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)
+
+    # Construct alignment target from reference with global transform + local deformation.
+    t = torch.randn(batch_size, 3, device=device) * 0.25
     target = ref.clone()
     target = target + t[query_batch]
     target = target + 0.05 * torch.sin(target * 2.0)

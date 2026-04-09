@@ -21,6 +21,7 @@ class FlowMatchingConfig:
         source_noise_scale: Noise amount for source samplers.
         time_eps: Numerical margin to avoid exactly 0/1 time values.
     """
+    """Configuration for alignment-specific flow matching."""
 
     sigma: float = 0.05
     source_type: Literal["gaussian", "reference_anchored", "query_perturbed"] = "reference_anchored"
@@ -51,6 +52,15 @@ class AlignmentFlowMatcher:
 
     def sigma_dot_t(self, t_node: Tensor) -> Tensor:
         """Compute derivative ``d sigma(t) / dt`` used in target vector field."""
+        self.config = config
+
+    def sample_time(self, num_graphs: int, device: torch.device) -> Tensor:
+        return torch.empty(num_graphs, device=device).uniform_(self.config.time_eps, 1.0 - self.config.time_eps)
+
+    def sigma_t(self, t_node: Tensor) -> Tensor:
+        return self.config.sigma * torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
+
+    def sigma_dot_t(self, t_node: Tensor) -> Tensor:
         denom = torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
         return self.config.sigma * 0.5 * (1.0 - 2.0 * t_node) / denom
 
@@ -131,6 +141,7 @@ def flow_matching_step(
         3) model forward on ``x_t``,
         4) vector-field regression loss.
     """
+    """Single ETFlowAlign flow-matching training step."""
     num_graphs = int(batch.query_batch.max().item()) + 1
     t_graph = matcher.sample_time(num_graphs=num_graphs, device=batch.query_pos.device)
     x_t, u_t = matcher.build_training_state(batch=batch, target_query_pos=target_query_pos, t_graph=t_graph)
