@@ -27,6 +27,7 @@ class AlignmentBatch:
         reference_batch: Graph index for each reference atom ``[Nr]``.
         pocket_pos: Optional pocket/receptor point coordinates.
     """
+    """Minimal self-contained batch container for ETFlowAlign."""
 
     query_pos: Tensor
     query_atom_type: Tensor
@@ -96,6 +97,7 @@ def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors:
         if node_idx.numel() <= 1:
             continue
         p = pos[node_idx]  # Local coordinates for graph g: [Ng, 3]
+        p = pos[node_idx]  # [Ng, 3]
         diff = p[:, None, :] - p[None, :, :]
         dist_sq = (diff * diff).sum(-1)
         mask = (dist_sq <= cutoff_sq) & (~torch.eye(node_idx.numel(), device=pos.device, dtype=torch.bool))
@@ -212,6 +214,7 @@ class ETFlowAlignModel(nn.Module):
         Returns:
             Velocity vectors for query atoms ``[Nq, 3]``.
         """
+        """Predict query velocity field v_theta(x_t, t, cond)."""
         if batch.query_pos.numel() == 0:
             return torch.zeros_like(batch.query_pos)
 
@@ -223,6 +226,13 @@ class ETFlowAlignModel(nn.Module):
         h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
         ref_dir, ref_dist = self._reference_context(batch)  # Conditioning from reference geometry.
         h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))  # Initial node states.
+        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)
+        x = batch.query_pos - com[batch.query_batch]
+
+        h_atom = self.atom_embed(batch.query_atom_type)
+        h_t = self.time_embed(t_graph)[batch.query_batch]
+        ref_dir, ref_dist = self._reference_context(batch)
+        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))
 
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
         for block in self.blocks:
@@ -230,4 +240,6 @@ class ETFlowAlignModel(nn.Module):
 
         gate = self.out_gate(h)  # Scalar gate per atom.
         v = gate * x  # Vector field aligned with equivariant coordinate features.
+        gate = self.out_gate(h)
+        v = gate * x
         return v
