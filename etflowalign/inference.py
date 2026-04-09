@@ -16,7 +16,7 @@ from torch import Tensor
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
 from .model import AlignmentBatch, ETFlowAlignModel
 from .sampler import ETFlowAlignSampler, GuidanceFn, ODESamplerConfig
-from .train import make_synthetic_alignment_batch
+from .train import load_alignment_batch_from_pt, make_synthetic_alignment_batch
 
 RankFn = Callable[[Tensor, AlignmentBatch], Tensor]
 
@@ -98,35 +98,17 @@ def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
 def run_inference(args: argparse.Namespace) -> None:
     """CLI inference routine: load checkpoint, sample, rank, and optionally save."""
     device = torch.device(args.device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt, model_args, flow_args, sampler_args, sampler, fm = _build_inference_runtime(args=args, device=device)
 
-    model_args = ckpt.get("model_args", {})  # Model architecture params saved during training.
-    flow_args = ckpt.get("flow_args", {})  # Flow matcher params for source sampling consistency.
-    device = torch.device(args.device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-
-    model = ETFlowAlignModel(**model_args).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-
-    fm = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
-    sampler = ETFlowAlignSampler(
-        model=model,
-        config=ODESamplerConfig(
-            n_steps=args.n_steps,
-            solver=args.solver,
-            guidance_scale=args.guidance_scale,
-            guidance_mode=args.guidance_mode,
-            max_guidance_norm=args.max_guidance_norm,
-        ),
-    )
-
-    # Demo input (replace with real preprocessed task data).
-    batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
+    if args.input_batch:
+        batch, _ = load_alignment_batch_from_pt(args.input_batch, device)
+    else:
+        # Demo input (replace with real preprocessed task data).
+        batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
     if args.use_pocket_guidance:
         batch.pocket_pos = batch.reference_pos + 0.1 * torch.randn_like(batch.reference_pos)
 
-    source_sampler = lambda b: fm.sample_source(b)  # noqa: E731
+    source_sampler = lambda b: fm.sample_inference_source(b)  # noqa: E731
     guidance_fn = make_pocket_pull_guidance(scale=1.0) if args.use_pocket_guidance else None
 
     candidates = generate_candidates(
@@ -137,27 +119,83 @@ def run_inference(args: argparse.Namespace) -> None:
         num_samples=args.num_samples,
     )
     ranked, scores = rank_candidates(candidates=candidates, batch=batch)
+    if args.top_k > 0:
+        ranked = ranked[: args.top_k]
+        scores = scores[: args.top_k]
 
     print(f"[inference] candidates={candidates.shape}")
     print(f"[inference] top_score={scores[0].item():.6f}")
 
     if args.save_path:
-        torch.save({"candidates": ranked.cpu(), "scores": scores.cpu()}, args.save_path)
+        torch.save(
+            {
+                "candidates": ranked.cpu(),
+                "scores": scores.cpu(),
+                "metadata": {
+                    "checkpoint": args.checkpoint,
+                    "model_args": model_args,
+                    "flow_args": flow_args,
+                    "sampler_args": sampler_args,
+                    "guidance_used": bool(args.use_pocket_guidance and args.guidance_scale > 0.0),
+                    "num_samples": args.num_samples,
+                    "top_k": args.top_k,
+                    "n_atoms": args.n_atoms,
+                    "training_step": ckpt.get("step"),
+                },
+            },
+            args.save_path,
+        )
         print(f"[inference] saved to: {args.save_path}")
+
+
+def _build_inference_runtime(args: argparse.Namespace, device: torch.device):
+    """Load checkpoint and construct model/flow/sampler runtime objects."""
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    model_args = ckpt.get("model_args", {})
+    flow_args = ckpt.get("flow_args", {})
+
+    model = ETFlowAlignModel(**model_args).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    fm = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
+    sampler_args = {
+        "n_steps": args.n_steps,
+        "solver": args.solver,
+        "guidance_scale": args.guidance_scale,
+        "guidance_mode": args.guidance_mode,
+        "max_guidance_norm": args.max_guidance_norm,
+        "pc_corrector_step_scale": args.pc_corrector_step_scale,
+        "adaptive_dt": args.adaptive_dt,
+        "adaptive_dt_min_scale": args.adaptive_dt_min_scale,
+        "adaptive_dt_max_scale": args.adaptive_dt_max_scale,
+        "log_trajectory": args.log_trajectory,
+        "max_trace_steps": args.max_trace_steps,
+    }
+    sampler = ETFlowAlignSampler(model=model, config=ODESamplerConfig(**sampler_args))
+    return ckpt, model_args, flow_args, sampler_args, sampler, fm
 
 
 def build_argparser() -> argparse.ArgumentParser:
     """Define CLI arguments for inference script."""
     p = argparse.ArgumentParser(description="Run ETFlowAlign inference on synthetic demo data.")
     p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--input-batch", type=str, default="", help="Path to torch batch file with query/reference/target tensors.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--num-samples", type=int, default=8)
+    p.add_argument("--top-k", type=int, default=0, help="If >0, keep only top-k ranked candidates.")
     p.add_argument("--n-atoms", type=int, default=16)
     p.add_argument("--n-steps", type=int, default=64)
     p.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"])
     p.add_argument("--guidance-scale", type=float, default=0.0)
     p.add_argument("--guidance-mode", type=str, default="vector_field", choices=["vector_field", "predictor_corrector"])
     p.add_argument("--max-guidance-norm", type=float, default=5.0)
+    p.add_argument("--pc-corrector-step-scale", type=float, default=1.0)
+    p.add_argument("--adaptive-dt", action="store_true")
+    p.add_argument("--adaptive-dt-min-scale", type=float, default=0.1)
+    p.add_argument("--adaptive-dt-max-scale", type=float, default=2.0)
+    p.add_argument("--log-trajectory", action="store_true")
+    p.add_argument("--max-trace-steps", type=int, default=2000)
     p.add_argument("--use-pocket-guidance", action="store_true")
     p.add_argument("--save-path", type=str, default="")
     return p
