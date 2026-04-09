@@ -23,6 +23,28 @@ class TrainConfig:
     weight_decay: float = 0.0
 
 
+def load_alignment_batch_from_pt(path: str, device: torch.device) -> tuple[AlignmentBatch, torch.Tensor]:
+    """Load a real-task style batch from a torch serialized dictionary.
+
+    Required keys:
+        query_pos, query_atom_type, query_batch, target_query_pos
+    Optional keys:
+        reference_pos, reference_atom_type, reference_batch, pocket_pos
+    """
+    payload = torch.load(path, map_location=device)
+    batch = AlignmentBatch(
+        query_pos=payload["query_pos"].to(device),
+        query_atom_type=payload["query_atom_type"].to(device),
+        query_batch=payload["query_batch"].to(device),
+        reference_pos=payload.get("reference_pos", None).to(device) if payload.get("reference_pos", None) is not None else None,
+        reference_atom_type=payload.get("reference_atom_type", None).to(device) if payload.get("reference_atom_type", None) is not None else None,
+        reference_batch=payload.get("reference_batch", None).to(device) if payload.get("reference_batch", None) is not None else None,
+        pocket_pos=payload.get("pocket_pos", None).to(device) if payload.get("pocket_pos", None) is not None else None,
+    )
+    target = payload["target_query_pos"].to(device)
+    return batch, target
+
+
 def build_training_components(model: ETFlowAlignModel, train_config: TrainConfig, fm_config: FlowMatchingConfig):
     """Create matcher + optimizer objects used in training."""
     matcher = AlignmentFlowMatcher(config=fm_config)
@@ -62,7 +84,6 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 
     # Construct alignment target from reference with global transform + local deformation.
     t = torch.randn(batch_size, 3, device=device) * 0.25  # Per-graph translation.
-    
     target = ref.clone()
     target = target + t[query_batch]
     target = target + 0.05 * torch.sin(target * 2.0)
@@ -91,27 +112,67 @@ def run_training(args: argparse.Namespace) -> None:
         sigma=args.sigma,
         source_type=args.source_type,
         source_noise_scale=args.source_noise_scale,
+        time_weighting=args.time_weighting,
+        allow_query_perturbed_for_inference=args.allow_query_perturbed_for_inference,
     )
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.steps)) if args.use_scheduler else None
 
+    val_batch = None
+    val_target = None
+    if args.val_data:
+        val_batch, val_target = load_alignment_batch_from_pt(args.val_data, device)
+
+    final_step = 0
+    best_val = float("inf")
+    best_state = None
     for step in range(1, args.steps + 1):
-        batch, target = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
+        if args.train_data:
+            batch, target = load_alignment_batch_from_pt(args.train_data, device)
+        else:
+            batch, target = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
         loss = train_step(model, matcher, optimizer, batch, target)
         if step % args.log_every == 0 or step == 1:
             print(f"[train] step={step:04d} loss={loss:.6f}")
 
+        if scheduler is not None:
+            scheduler.step()
+
+        if val_batch is not None and (step % args.val_every == 0 or step == args.steps):
+            model.eval()
+            with torch.no_grad():
+                vloss = float(flow_matching_step(model=model, matcher=matcher, batch=val_batch, target_query_pos=val_target).item())
+            print(f"[val] step={step:04d} loss={vloss:.6f}")
+            if vloss < best_val:
+                best_val = vloss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            model.train()
+        final_step = step
+
     ckpt = {
+        "step": final_step,
         "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
         "model_args": {
             "hidden_dim": args.hidden_dim,
             "num_blocks": args.num_blocks,
+        },
+        "train_config": {
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "batch_size": args.batch_size,
+            "n_atoms": args.n_atoms,
         },
         "flow_args": {
             "sigma": args.sigma,
             "source_type": args.source_type,
             "source_noise_scale": args.source_noise_scale,
+            "time_weighting": args.time_weighting,
+            "allow_query_perturbed_for_inference": args.allow_query_perturbed_for_inference,
         },
+        "best_val_loss": best_val if val_batch is not None else None,
+        "best_model_state": best_state,
     }
     torch.save(ckpt, args.save_path)
     print(f"[train] checkpoint saved to: {args.save_path}")
@@ -129,9 +190,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=0.05)
-    p.add_argument("--source-type", type=str, default="reference_anchored", choices=["gaussian", "reference_anchored", "query_perturbed"])
+    p.add_argument(
+        "--source-type",
+        type=str,
+        default="reference_anchored",
+        choices=["gaussian", "reference_anchored", "query_perturbed", "rigid_reference_perturbed"],
+    )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
+    p.add_argument("--time-weighting", type=str, default="uniform", choices=["uniform", "mid"])
+    p.add_argument("--allow-query-perturbed-for-inference", action="store_true")
     p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--train-data", type=str, default="", help="Path to torch file for real training batch.")
+    p.add_argument("--val-data", type=str, default="", help="Path to torch file for real validation batch.")
+    p.add_argument("--val-every", type=int, default=50)
+    p.add_argument("--use-scheduler", action="store_true")
     p.add_argument("--save-path", type=str, default="etflowalign_ckpt.pt")
     return p
 
