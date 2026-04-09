@@ -102,7 +102,7 @@ python -m etflowalign.inference --help
 1. **Backbone simplification**: uses a compact EGNN-style block, but not yet a full production molecular transformer.
 2. **Synthetic data only**: training/inference scripts currently run on synthetic alignment batches for smoke testing.
 3. **Guidance placeholder**: pocket guidance is provided as a safe hook with clipping, not yet full UFF physics integration.
-4. **Ranking placeholder**: ranking adapter defaults to a simple geometric score instead of production metrics (e.g., TanimotoCombo + docking score).
+4. **Ranking plugin baseline**: inference now exposes a pluggable TanimotoCombo+physics ranker, but production docking engines/ROCS plugins still need to be wired for benchmark-grade scoring.
 5. **No benchmark pipeline yet**: dataset preprocessing/evaluation scripts for real alignment benchmarks are pending.
 
 ---
@@ -130,7 +130,7 @@ python -m etflowalign.inference --help
 - [ ] Add distributed and mixed-precision training support.
 
 ### `inference.py`
-- [ ] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
+- [x] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
 - [ ] Add batch inference over benchmark sets and structured output export.
 - [ ] Add reranking ensemble hooks.
 
@@ -191,3 +191,11 @@ python -m etflowalign.inference \
   --adaptive-dt \
   --save-path etflowalign_samples.pt
 ```
+
+
+### Ranking backend notes
+
+- `--ranker plugin_combo` (default): combines a TanimotoCombo-like proxy score and docking/physics proxy score.
+- `--ranker legacy_reference_mse`: compatibility mode using the old negative-reference-MSE score.
+- Saved inference artifacts now include `component_scores` (`tanimoto`, `physics`) plus ranker metadata.
+- For production use, inject external plugin callbacks (e.g., ROCS/OpenEye + docking engine) through `PluginRanker`.
