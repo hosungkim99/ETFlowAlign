@@ -129,7 +129,7 @@ iterative update
 
 즉 “학습된 flow를 가지고 실제로 어떻게 샘플을 얻는가”를 정리한다.
 ```bash
-python -m etflowalign.train \
+python -m etflowalign/train.py \
   --steps 200 \
   --batch-size 8 \
   --n-atoms 16 \
@@ -157,7 +157,7 @@ batch 처리
 하지만 너무 많은 핵심 로직을 여기 숨기면 안 된다.
 
 ```bash
-python -m etflowalign.inference \
+python -m etflowalign/inference.py \
   --checkpoint etflowalign_ckpt.pt \
   --num-samples 16 \
   --n-steps 64 \
