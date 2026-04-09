@@ -43,7 +43,6 @@ def generate_candidates(
         guidance_fn: Optional guidance callback.
         num_samples: Number of candidates to generate.
     """
-    """Generate aligned query candidates as [num_samples, N, 3]."""
     outputs = []
     for _ in range(num_samples):
         x0 = source_sampler(batch)
@@ -105,9 +104,6 @@ def run_inference(args: argparse.Namespace) -> None:
     flow_args = ckpt.get("flow_args", {})  # Flow matcher params for source sampling consistency.
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
-
-    model_args = ckpt.get("model_args", {})
-    flow_args = ckpt.get("flow_args", {})
 
     model = ETFlowAlignModel(**model_args).to(device)
     model.load_state_dict(ckpt["model_state"])
