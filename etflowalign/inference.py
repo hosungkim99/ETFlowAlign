@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
+from .guidance import UFFGuidanceConfig, UFFPocketGuidance
 from .model import AlignmentBatch, ETFlowAlignModel
 from .rankers import LegacyReferenceMseRanker, PluginRanker, RankerConfig
 from .sampler import ETFlowAlignSampler, GuidanceFn, ODESamplerConfig
@@ -101,7 +102,21 @@ def run_inference(args: argparse.Namespace) -> None:
         batch.pocket_pos = batch.reference_pos + 0.1 * torch.randn_like(batch.reference_pos)
 
     source_sampler = lambda b: fm.sample_inference_source(b)  # noqa: E731
-    guidance_fn = make_pocket_pull_guidance(scale=1.0) if args.use_pocket_guidance else None
+    guidance_fn = None
+    if args.use_pocket_guidance:
+        if args.guidance_backend == "uff":
+            guidance_fn = UFFPocketGuidance(
+                UFFGuidanceConfig(
+                    scale=1.0,
+                    query_repulsion_weight=args.uff_query_repulsion_weight,
+                    pocket_attraction_weight=args.uff_pocket_attraction_weight,
+                    pocket_repulsion_weight=args.uff_pocket_repulsion_weight,
+                    epsilon=args.uff_epsilon,
+                    sigma=args.uff_sigma,
+                )
+            )
+        else:
+            guidance_fn = make_pocket_pull_guidance(scale=1.0)
 
     candidates = generate_candidates(
         sampler=sampler,
@@ -136,6 +151,7 @@ def run_inference(args: argparse.Namespace) -> None:
                     "input_has_query_node_attr": bool(batch.query_node_attr is not None),
                     "input_has_reference_node_attr": bool(batch.reference_node_attr is not None),
                     "guidance_used": bool(args.use_pocket_guidance and args.guidance_scale > 0.0),
+                    "guidance_backend": args.guidance_backend,
                     "ranker": args.ranker,
                     "tanimoto_weight": args.tanimoto_weight,
                     "physics_weight": args.physics_weight,
@@ -169,6 +185,11 @@ def _build_inference_runtime(args: argparse.Namespace, device: torch.device):
     """Load checkpoint and construct model/flow/sampler runtime objects."""
     ckpt = torch.load(args.checkpoint, map_location=device)
     model_args = ckpt.get("model_args", {})
+    if "backbone_type" not in model_args:
+        # Backward compatibility for early checkpoints trained with EGNN blocks.
+        model_args["backbone_type"] = "egnn"
+    if "num_heads" not in model_args:
+        model_args["num_heads"] = 4
     flow_args = ckpt.get("flow_args", {})
 
     model = ETFlowAlignModel(**model_args).to(device)
@@ -220,6 +241,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--log-trajectory", action="store_true")
     p.add_argument("--max-trace-steps", type=int, default=2000)
     p.add_argument("--use-pocket-guidance", action="store_true")
+    p.add_argument("--guidance-backend", type=str, default="uff", choices=["uff", "toy_pull"])
+    p.add_argument("--uff-query-repulsion-weight", type=float, default=0.2)
+    p.add_argument("--uff-pocket-attraction-weight", type=float, default=1.0)
+    p.add_argument("--uff-pocket-repulsion-weight", type=float, default=0.5)
+    p.add_argument("--uff-epsilon", type=float, default=0.1)
+    p.add_argument("--uff-sigma", type=float, default=1.5)
     p.add_argument("--save-path", type=str, default="")
     return p
 

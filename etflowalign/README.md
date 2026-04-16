@@ -1,4 +1,13 @@
 # ETFlowAlign
+
+ETFlowAlign is a **flow-matching re-design of DiffAlign** for flexible molecular alignment.
+
+It preserves DiffAlign's task contract (query ligand alignment conditioned on a reference ligand and optional pocket context) while replacing diffusion-style denoising dynamics with an ET-Flow-style time-dependent vector field and ODE sampling.
+
+---
+
+## Design summary
+
 Start here:
 1. `model.py` for the overall architecture
 2. `flow_matching.py` for the training objective
@@ -35,10 +44,8 @@ training target 생성
 5. Pocket-aware guidance as an inference-time steering signal.
 6. Multi-sample generation + ranking compatibility.
 
-을 넣는다.
 ### Imported from ET-Flow
 
-즉 diffusion loss를 대체하는 수학적 핵심을 둔다.
 1. Flow-matching vector-field regression objective.
 2. Continuous-time vector field `v_theta(x_t, t, cond)`.
 3. Interpolation probability path between source and target states.
@@ -360,6 +367,7 @@ python -m etflowalign.inference \
   --num-samples 16 \
   --n-steps 64 \
   --solver heun \
+  --guidance-backend uff \
   --guidance-scale 0.2 \
   --use-pocket-guidance \
   --save-path etflowalign_samples.pt

@@ -29,6 +29,9 @@ class FlowMatchingConfig:
     time_eps: float = 1e-4
     time_weighting: Literal["uniform", "mid"] = "uniform"
     allow_query_perturbed_for_inference: bool = False
+    use_kabsch_alignment: bool = True
+    harmonic_prior_strength: float = 0.0
+    harmonic_relax_steps: int = 1
 
 
 class AlignmentFlowMatcher:
@@ -127,6 +130,66 @@ class AlignmentFlowMatcher:
             x0[idx] = centered @ q.T + com + trans
         return x0
 
+    def _kabsch_align_source_to_target(self, x0: Tensor, target_query_pos: Tensor, batch_index: Tensor) -> Tensor:
+        """Apply per-graph Kabsch alignment from source to target coordinates."""
+        x_aligned = x0.clone()
+        num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 0
+        for g in range(num_graphs):
+            idx = torch.where(batch_index == g)[0]
+            if idx.numel() <= 1:
+                continue
+            src = x0[idx]
+            dst = target_query_pos[idx]
+            src_mean = src.mean(dim=0, keepdim=True)
+            dst_mean = dst.mean(dim=0, keepdim=True)
+            src_c = src - src_mean
+            dst_c = dst - dst_mean
+            cov = src_c.transpose(0, 1) @ dst_c
+            u, _, v_t = torch.linalg.svd(cov)
+            r = v_t.transpose(0, 1) @ u.transpose(0, 1)
+            if torch.det(r) < 0:
+                v_t[-1, :] *= -1
+                r = v_t.transpose(0, 1) @ u.transpose(0, 1)
+            x_aligned[idx] = src_c @ r + dst_mean
+        return x_aligned
+
+    def _harmonic_relax(self, x: Tensor, ref: Tensor) -> Tensor:
+        """One-step spring relaxation toward reference pairwise geometry."""
+        if x.size(0) <= 1:
+            return x
+        delta = x[:, None, :] - x[None, :, :]
+        d = torch.norm(delta, dim=-1, keepdim=True).clamp_min(1e-6)
+        with torch.no_grad():
+            d_ref = torch.cdist(ref, ref).unsqueeze(-1).clamp_min(1e-6)
+        force = ((d_ref - d) / d) * delta
+        # Remove self-interaction and aggregate pair forces.
+        eye = torch.eye(x.size(0), device=x.device, dtype=torch.bool)
+        force[eye] = 0.0
+        step = force.sum(dim=1) / max(1, x.size(0) - 1)
+        return x + self.config.harmonic_prior_strength * step
+
+    def _apply_harmonic_prior_if_needed(self, x0: Tensor, batch: AlignmentBatch) -> Tensor:
+        """Apply harmonic prior relaxation when reference geometry is available."""
+        if self.config.harmonic_prior_strength <= 0.0:
+            return x0
+        if batch.reference_pos is None or batch.reference_batch is None:
+            return x0
+        if x0.size(0) != batch.reference_pos.size(0) or not torch.equal(batch.query_batch, batch.reference_batch):
+            return x0
+
+        out = x0.clone()
+        num_graphs = int(batch.query_batch.max().item()) + 1 if batch.query_batch.numel() else 0
+        for g in range(num_graphs):
+            idx = torch.where(batch.query_batch == g)[0]
+            if idx.numel() <= 1:
+                continue
+            cur = out[idx]
+            ref = batch.reference_pos[idx]
+            for _ in range(max(1, int(self.config.harmonic_relax_steps))):
+                cur = self._harmonic_relax(cur, ref)
+            out[idx] = cur
+        return out
+
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         """Construct noisy path state and vector-field regression target.
 
@@ -141,6 +204,9 @@ class AlignmentFlowMatcher:
         """
         t_node = t_graph[batch.query_batch]
         x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
+        x0 = self._apply_harmonic_prior_if_needed(x0=x0, batch=batch)
+        if self.config.use_kabsch_alignment:
+            x0 = self._kabsch_align_source_to_target(x0=x0, target_query_pos=target_query_pos, batch_index=batch.query_batch)
         eps = torch.randn_like(target_query_pos)
 
         sigma = self.sigma_t(t_node).unsqueeze(-1)

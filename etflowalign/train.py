@@ -115,6 +115,8 @@ def run_training(args: argparse.Namespace) -> None:
         edge_cutoff=args.edge_cutoff,
         max_neighbors=args.max_neighbors,
         extra_feat_dim=args.extra_feat_dim,
+        backbone_type=args.backbone_type,
+        num_heads=args.num_heads,
     ).to(device)
 
     fm_config = FlowMatchingConfig(
@@ -123,6 +125,9 @@ def run_training(args: argparse.Namespace) -> None:
         source_noise_scale=args.source_noise_scale,
         time_weighting=args.time_weighting,
         allow_query_perturbed_for_inference=args.allow_query_perturbed_for_inference,
+        use_kabsch_alignment=not args.disable_kabsch_alignment,
+        harmonic_prior_strength=args.harmonic_prior_strength,
+        harmonic_relax_steps=args.harmonic_relax_steps,
     )
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
@@ -170,6 +175,8 @@ def run_training(args: argparse.Namespace) -> None:
             "edge_cutoff": args.edge_cutoff,
             "max_neighbors": args.max_neighbors,
             "extra_feat_dim": args.extra_feat_dim,
+            "backbone_type": args.backbone_type,
+            "num_heads": args.num_heads,
         },
         "train_config": {
             "lr": args.lr,
@@ -183,6 +190,9 @@ def run_training(args: argparse.Namespace) -> None:
             "source_noise_scale": args.source_noise_scale,
             "time_weighting": args.time_weighting,
             "allow_query_perturbed_for_inference": args.allow_query_perturbed_for_inference,
+            "use_kabsch_alignment": not args.disable_kabsch_alignment,
+            "harmonic_prior_strength": args.harmonic_prior_strength,
+            "harmonic_relax_steps": args.harmonic_relax_steps,
         },
         "best_val_loss": best_val if val_batch is not None else None,
         "best_model_state": best_state,
@@ -204,6 +214,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--edge-cutoff", type=float, default=6.0)
     p.add_argument("--max-neighbors", type=int, default=32)
     p.add_argument("--extra-feat-dim", type=int, default=0, help="Feature dim for optional query/reference node attributes.")
+    p.add_argument("--backbone-type", type=str, default="torchmd_et", choices=["egnn", "torchmd_et"])
+    p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=0.05)
@@ -216,6 +228,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--time-weighting", type=str, default="uniform", choices=["uniform", "mid"])
     p.add_argument("--allow-query-perturbed-for-inference", action="store_true")
+    p.add_argument("--disable-kabsch-alignment", action="store_true")
+    p.add_argument("--harmonic-prior-strength", type=float, default=0.0)
+    p.add_argument("--harmonic-relax-steps", type=int, default=1)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--train-data", type=str, default="", help="Path to torch file for real training batch.")
     p.add_argument("--val-data", type=str, default="", help="Path to torch file for real validation batch.")
