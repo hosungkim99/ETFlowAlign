@@ -113,6 +113,9 @@ def run_inference(args: argparse.Namespace) -> None:
                     pocket_repulsion_weight=args.uff_pocket_repulsion_weight,
                     epsilon=args.uff_epsilon,
                     sigma=args.uff_sigma,
+                    backend_mode=args.uff_backend_mode,
+                    backend_module=args.uff_backend_module,
+                    backend_symbol=args.uff_backend_symbol,
                 )
             )
         else:
@@ -152,6 +155,9 @@ def run_inference(args: argparse.Namespace) -> None:
                     "input_has_reference_node_attr": bool(batch.reference_node_attr is not None),
                     "guidance_used": bool(args.use_pocket_guidance and args.guidance_scale > 0.0),
                     "guidance_backend": args.guidance_backend,
+                    "uff_backend_mode": args.uff_backend_mode,
+                    "uff_backend_module": args.uff_backend_module if args.uff_backend_module else None,
+                    "uff_backend_symbol": args.uff_backend_symbol if args.uff_backend_symbol else None,
                     "ranker": args.ranker,
                     "tanimoto_weight": args.tanimoto_weight,
                     "physics_weight": args.physics_weight,
@@ -247,6 +253,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--uff-pocket-repulsion-weight", type=float, default=0.5)
     p.add_argument("--uff-epsilon", type=float, default=0.1)
     p.add_argument("--uff-sigma", type=float, default=1.5)
+    p.add_argument("--uff-backend-mode", type=str, default="auto", choices=["auto", "uff_pytorch", "surrogate"])
+    p.add_argument("--uff-backend-module", type=str, default="")
+    p.add_argument("--uff-backend-symbol", type=str, default="")
     p.add_argument("--save-path", type=str, default="")
     return p
 

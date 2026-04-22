@@ -89,18 +89,22 @@ class ETFlowAlignSampler:
         if guidance_fn is None or self.config.guidance_scale <= 0.0:
             return x, v
 
-        cur = AlignmentBatch(
-            query_pos=x,
-            query_atom_type=batch.query_atom_type,
-            query_batch=batch.query_batch,
-            reference_pos=batch.reference_pos,
-            reference_atom_type=batch.reference_atom_type,
-            reference_batch=batch.reference_batch,
-            pocket_pos=batch.pocket_pos,
-            query_node_attr=batch.query_node_attr,
-            reference_node_attr=batch.reference_node_attr,
-        )
-        g = self._clip_guidance(guidance_fn(cur, t_graph, v))
+        # UFF-style guidance requires local autograd even though sampling loop is no_grad.
+        with torch.enable_grad():
+            x_for_guidance = x.detach().clone().requires_grad_(True)
+            cur = AlignmentBatch(
+                query_pos=x_for_guidance,
+                query_atom_type=batch.query_atom_type,
+                query_batch=batch.query_batch,
+                reference_pos=batch.reference_pos,
+                reference_atom_type=batch.reference_atom_type,
+                reference_batch=batch.reference_batch,
+                pocket_pos=batch.pocket_pos,
+                query_node_attr=batch.query_node_attr,
+                reference_node_attr=batch.reference_node_attr,
+            )
+            g = guidance_fn(cur, t_graph, v)
+        g = self._clip_guidance(g.detach())
 
         if self.config.guidance_mode == "vector_field":
             return x, v + self.config.guidance_scale * g
