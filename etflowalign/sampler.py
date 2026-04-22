@@ -11,7 +11,6 @@ from torch import Tensor
 from .model import AlignmentBatch, ETFlowAlignModel
 
 GuidanceFn = Callable[[AlignmentBatch, Tensor, Tensor], Tensor]
-RefineFn = Callable[[AlignmentBatch, Tensor, Tensor], Tensor]
 
 
 @dataclass
@@ -73,14 +72,10 @@ class ETFlowAlignSampler:
             reference_atom_type=batch.reference_atom_type,
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
-            query_node_attr=batch.query_node_attr,
-            reference_node_attr=batch.reference_node_attr,
         )
         return self.model(cur, t_graph=t_graph)
 
-    def _apply_guidance(
-        self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]
-    ) -> tuple[Tensor, Tensor]:
+    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> Tensor:
         """Apply optional external guidance based on configured mode.
 
         Returns:
@@ -89,42 +84,26 @@ class ETFlowAlignSampler:
         if guidance_fn is None or self.config.guidance_scale <= 0.0:
             return x, v
 
-        # UFF-style guidance requires local autograd even though sampling loop is no_grad.
-        with torch.enable_grad():
-            x_for_guidance = x.detach().clone().requires_grad_(True)
-            cur = AlignmentBatch(
-                query_pos=x_for_guidance,
-                query_atom_type=batch.query_atom_type,
-                query_batch=batch.query_batch,
-                reference_pos=batch.reference_pos,
-                reference_atom_type=batch.reference_atom_type,
-                reference_batch=batch.reference_batch,
-                pocket_pos=batch.pocket_pos,
-                query_node_attr=batch.query_node_attr,
-                reference_node_attr=batch.reference_node_attr,
-            )
-            g = guidance_fn(cur, t_graph, v)
-        g = self._clip_guidance(g.detach())
+        cur = AlignmentBatch(
+            query_pos=x,
+            query_atom_type=batch.query_atom_type,
+            query_batch=batch.query_batch,
+            reference_pos=batch.reference_pos,
+            reference_atom_type=batch.reference_atom_type,
+            reference_batch=batch.reference_batch,
+            pocket_pos=batch.pocket_pos,
+        )
+        g = self._clip_guidance(guidance_fn(cur, t_graph, v))
 
         if self.config.guidance_mode == "vector_field":
             return x, v + self.config.guidance_scale * g
 
         # predictor-corrector style: update state separately by guidance.
-        x = x + (
-            self.config.pc_corrector_step_scale
-            * self.config.guidance_scale
-            / max(1, self.config.n_steps)
-        ) * g
+        x = x + (self.config.guidance_scale / max(1, self.config.n_steps)) * g
         return x, v
 
     @torch.no_grad()
-    def sample(
-        self,
-        batch: AlignmentBatch,
-        x0: Tensor,
-        guidance_fn: Optional[GuidanceFn] = None,
-        refine_fn: Optional[RefineFn] = None,
-    ) -> Tensor:
+    def sample(self, batch: AlignmentBatch, x0: Tensor, guidance_fn: Optional[GuidanceFn] = None) -> Tensor:
         """Integrate ODE from source state to final aligned state.
 
         Args:
@@ -139,7 +118,6 @@ class ETFlowAlignSampler:
         t_grid = torch.linspace(self.config.t_start, self.config.t_end, self.config.n_steps + 1, device=x0.device)
 
         x = x0.clone()
-        self.last_trace: list[dict[str, float]] = []
         for i in range(self.config.n_steps):
             t = t_grid[i]
             dt = t_grid[i + 1] - t
@@ -148,40 +126,15 @@ class ETFlowAlignSampler:
             v = self._model_v(batch, x, t_graph)
             x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn)
 
-            dt_eff = dt
-            if self.config.adaptive_dt:
-                v_norm = torch.norm(v, dim=-1).mean().clamp_min(1e-8)
-                dt_eff = dt / v_norm
-                dt_eff = dt_eff.clamp(
-                    min=float(dt) * self.config.adaptive_dt_min_scale,
-                    max=float(dt) * self.config.adaptive_dt_max_scale,
-                )
-
             if self.config.solver == "euler":
-                x = x + dt_eff * v
+                x = x + dt * v
             else:
-                x_pred = x + dt_eff * v
+                x_pred = x + dt * v
                 t_next = torch.full((num_graphs,), float(t_grid[i + 1]), device=x.device)
                 v_next = self._model_v(batch, x_pred, t_next)
-                # Guidance should also affect corrected slope in Heun mode.
-                _, v_next = self._apply_guidance(batch, x_pred, t_next, v_next, guidance_fn)
-                x = x + 0.5 * dt_eff * (v + v_next)
-
-            # Optional clean-state refinement hook (for physics/UFF style correctors).
-            if refine_fn is not None:
-                x = refine_fn(batch, t_graph, x)
+                x = x + 0.5 * dt * (v + v_next)
 
             if not torch.isfinite(x).all():
                 raise FloatingPointError("Non-finite coordinates during ODE integration. Reduce guidance scale.")
-
-            if self.config.log_trajectory and len(self.last_trace) < self.config.max_trace_steps:
-                self.last_trace.append(
-                    {
-                        "step": float(i),
-                        "t": float(t.item()),
-                        "x_norm": float(torch.norm(x, dim=-1).mean().item()),
-                        "v_norm": float(torch.norm(v, dim=-1).mean().item()),
-                    }
-                )
 
         return x

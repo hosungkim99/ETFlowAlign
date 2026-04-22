@@ -8,7 +8,7 @@ be understood from this repository without external wrappers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor, nn
@@ -68,6 +68,24 @@ class SimpleTimeEmbedding(nn.Module):
         if emb.size(-1) < self.dim:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return self.proj(emb)
+
+
+def _segment_mean(x: Tensor, batch: Tensor, num_graphs: int) -> Tensor:
+    """Compute per-graph mean of node features/coordinates.
+
+    Args:
+        x: Node tensor ``[N, D]``.
+        batch: Graph index per node ``[N]``.
+        num_graphs: Number of graphs in the mini-batch.
+
+    Returns:
+        Mean tensor per graph ``[num_graphs, D]``.
+    """
+    out = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
+    cnt = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
+    out.index_add_(0, batch, x)
+    cnt.index_add_(0, batch, torch.ones_like(batch, dtype=x.dtype).unsqueeze(-1))
+    return out / cnt.clamp_min(1.0)
 
 
 def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors: int) -> Tensor:
@@ -222,118 +240,33 @@ class ETFlowAlignModel(nn.Module):
         atom_vocab_size: int = 128,
         hidden_dim: int = 128,
         time_embed_dim: int = 64,
-        extra_feat_dim: int = 0,
         num_blocks: int = 4,
         edge_cutoff: float = 6.0,
         max_neighbors: int = 32,
-        backbone_type: Literal["egnn", "torchmd_et"] = "torchmd_et",
-        num_heads: int = 4,
     ) -> None:
         super().__init__()
         self.edge_cutoff = float(edge_cutoff)
         self.max_neighbors = int(max_neighbors)
-        self.backbone_type = backbone_type
-        self.num_heads = int(num_heads)
 
         self.atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
-        self.reference_atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
         self.time_embed = SimpleTimeEmbedding(time_embed_dim)
-        self.extra_feat_dim = int(extra_feat_dim)
-        self.query_feat_proj = nn.Linear(self.extra_feat_dim, hidden_dim) if self.extra_feat_dim > 0 else None
-        self.reference_feat_proj = nn.Linear(self.extra_feat_dim, hidden_dim) if self.extra_feat_dim > 0 else None
-        # [query_atom, time, ref_dir(3), ref_dist(1), pooled_ref_atom_feat]
-        self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4 + hidden_dim, hidden_dim)
-        self.block_condition = nn.Sequential(
-            nn.Linear(hidden_dim + 4, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4, hidden_dim)
 
-        if self.backbone_type == "egnn":
-            self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
-        elif self.backbone_type == "torchmd_et":
-            self.blocks = nn.ModuleList([TorchMDEquivariantTransformerBlock(hidden_dim, num_heads=self.num_heads) for _ in range(num_blocks)])
-        else:
-            raise ValueError(f"Unsupported backbone_type: {self.backbone_type}")
-        # More expressive equivariant head than v = gate * x:
-        # combine query-relative vector x and reference direction vector.
-        self.out_scale_x = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
-        self.out_scale_ref = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
+        self.out_gate = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
 
-    def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor, Tensor]:
-        """Return reference-aware geometric + feature context for each query atom.
-
-        Returns:
-            direction: Unit vector from query atom to weighted reference anchor.
-            distance: Norm of the query-to-anchor vector.
-            ref_feat: Weighted pooled reference atom-type embedding.
-        """
+    def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor]:
+        """Return direction and distance from query atoms to reference center."""
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
             zero = torch.zeros_like(batch.query_pos)
-            zeros_feat = torch.zeros(
-                batch.query_pos.size(0), self.atom_embed.embedding_dim, device=batch.query_pos.device, dtype=batch.query_pos.dtype
-            )
-            return zero, torch.zeros(batch.query_pos.size(0), 1, device=batch.query_pos.device, dtype=batch.query_pos.dtype), zeros_feat
+            return zero, torch.zeros(batch.query_pos.size(0), 1, device=batch.query_pos.device, dtype=batch.query_pos.dtype)
 
-        # Fallback when reference atom types are not available.
-        if batch.reference_atom_type is None:
-            ref_atom_feat_all = torch.zeros(
-                batch.reference_pos.size(0), self.atom_embed.embedding_dim, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype
-            )
-        else:
-            ref_atom_feat_all = self.reference_atom_embed(batch.reference_atom_type)
-        if self.reference_feat_proj is not None and batch.reference_node_attr is not None:
-            ref_atom_feat_all = ref_atom_feat_all + self.reference_feat_proj(batch.reference_node_attr)
-
-        direction = torch.zeros_like(batch.query_pos)
-        distance = torch.zeros(batch.query_pos.size(0), 1, device=batch.query_pos.device, dtype=batch.query_pos.dtype)
-        ref_feat = torch.zeros(
-            batch.query_pos.size(0), ref_atom_feat_all.size(-1), device=batch.query_pos.device, dtype=batch.query_pos.dtype
-        )
-
-        num_graphs = int(batch.query_batch.max().item()) + 1
-        for g in range(num_graphs):
-            q_idx = torch.where(batch.query_batch == g)[0]
-            r_idx = torch.where(batch.reference_batch == g)[0]
-            if q_idx.numel() == 0 or r_idx.numel() == 0:
-                continue
-
-            q = batch.query_pos[q_idx]   # [Nq, 3]
-            r = batch.reference_pos[r_idx]  # [Nr, 3]
-            rf = ref_atom_feat_all[r_idx]  # [Nr, H]
-
-            # Query-reference soft assignment (cross-graph attention-like conditioning).
-            d2 = torch.cdist(q, r, p=2) ** 2
-            w = torch.softmax(-d2, dim=-1)  # [Nq, Nr]
-            r_anchor = w @ r
-            rf_anchor = w @ rf
-
-            delta = r_anchor - q
-            dist = safe_norm(delta, dim=-1, keepdim=True)
-            direction[q_idx] = delta / dist.clamp_min(1e-8)
-            distance[q_idx] = dist
-            ref_feat[q_idx] = rf_anchor
-
-        return direction, distance, ref_feat
-
-    def _validate_optional_features(self, batch: AlignmentBatch) -> None:
-        """Validate optional chemistry feature tensors for safe usage."""
-        if batch.query_node_attr is not None:
-            if batch.query_node_attr.size(0) != batch.query_pos.size(0):
-                raise ValueError("query_node_attr first dimension must match query_pos.")
-            if self.query_feat_proj is None:
-                raise ValueError("query_node_attr provided but model.extra_feat_dim == 0.")
-            if batch.query_node_attr.size(-1) != self.extra_feat_dim:
-                raise ValueError(f"query_node_attr feature dim must be {self.extra_feat_dim}.")
-        if batch.reference_node_attr is not None:
-            if batch.reference_pos is None:
-                raise ValueError("reference_node_attr provided but reference_pos is None.")
-            if batch.reference_node_attr.size(0) != batch.reference_pos.size(0):
-                raise ValueError("reference_node_attr first dimension must match reference_pos.")
-            if self.reference_feat_proj is None:
-                raise ValueError("reference_node_attr provided but model.extra_feat_dim == 0.")
-            if batch.reference_node_attr.size(-1) != self.extra_feat_dim:
-                raise ValueError(f"reference_node_attr feature dim must be {self.extra_feat_dim}.")
+        num_ref_graphs = int(batch.reference_batch.max().item()) + 1
+        ref_center = _segment_mean(batch.reference_pos, batch.reference_batch, num_ref_graphs)
+        delta = ref_center[batch.query_batch] - batch.query_pos
+        dist = torch.norm(delta, dim=-1, keepdim=True)
+        direction = delta / dist.clamp_min(1e-8)
+        return direction, dist
 
     def forward(self, batch: AlignmentBatch, t_graph: Tensor) -> Tensor:
         """Predict query velocity field ``v_theta(x_t, t, cond)``.
@@ -347,27 +280,20 @@ class ETFlowAlignModel(nn.Module):
         """
         if batch.query_pos.numel() == 0:
             return torch.zeros_like(batch.query_pos)
-        self._validate_optional_features(batch)
 
         num_graphs = int(batch.query_batch.max().item()) + 1
-        com = segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
+        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
         x = batch.query_pos - com[batch.query_batch]  # Translation-invariant coordinates.
 
         h_atom = self.atom_embed(batch.query_atom_type)  # Atom identity features.
-        if self.query_feat_proj is not None and batch.query_node_attr is not None:
-            h_atom = h_atom + self.query_feat_proj(batch.query_node_attr)
         h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
-        ref_dir, ref_dist, ref_feat = self._reference_context(batch)  # Conditioning from reference geometry + atom types.
-        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist, ref_feat], dim=-1))  # Initial node states.
+        ref_dir, ref_dist = self._reference_context(batch)  # Conditioning from reference geometry.
+        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))  # Initial node states.
 
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
-        cond_block = self.block_condition(torch.cat([ref_feat, ref_dir, ref_dist], dim=-1))
         for block in self.blocks:
-            # Re-inject conditioning at every message-passing block (not only at input concat).
-            h = h + cond_block
             h, x = block(h, x, edge_index)
 
-        scale_x = self.out_scale_x(h)
-        scale_ref = self.out_scale_ref(h)
-        v = scale_x * x + scale_ref * ref_dir
+        gate = self.out_gate(h)  # Scalar gate per atom.
+        v = gate * x  # Vector field aligned with equivariant coordinate features.
         return v

@@ -74,20 +74,6 @@ bash setup_env.sh --mode cpu
 conda activate etflowalign
 ```
 
-Reproducible UFF install (pin tag/commit):
-
-```bash
-cd etflowalign
-bash setup_env.sh --mode cuda --uff-ref <commit_or_tag>
-```
-
-Optional post-install smoke test:
-
-```bash
-cd etflowalign
-bash setup_env.sh --mode cpu --smoke-test
-```
-
 Then run scripts from repository root (or with `python -m ...` from root):
 
 ```bash
@@ -102,7 +88,7 @@ python -m etflowalign.inference --help
 1. **Backbone simplification**: uses a compact EGNN-style block, but not yet a full production molecular transformer.
 2. **Synthetic data only**: training/inference scripts currently run on synthetic alignment batches for smoke testing.
 3. **Guidance placeholder**: pocket guidance is provided as a safe hook with clipping, not yet full UFF physics integration.
-4. **Ranking plugin baseline**: inference now exposes a pluggable TanimotoCombo+physics ranker, but production docking engines/ROCS plugins still need to be wired for benchmark-grade scoring.
+4. **Ranking placeholder**: ranking adapter defaults to a simple geometric score instead of production metrics (e.g., TanimotoCombo + docking score).
 5. **No benchmark pipeline yet**: dataset preprocessing/evaluation scripts for real alignment benchmarks are pending.
 
 ---
@@ -110,19 +96,18 @@ python -m etflowalign.inference --help
 ## Next-commit concrete checklist (per file)
 
 ### `model.py`
-- [x] Replace compact EGNN-style block with TorchMD-ET style equivariant transformer backbone option (`--backbone-type torchmd_et`).
+- [ ] Replace compact EGNN-style block with a stronger E(3)-equivariant transformer-style backbone.
 - [ ] Add richer conditioning channels (reference atom features, cross-graph attention).
 - [ ] Add optional chirality-aware auxiliary head.
 
 ### `flow_matching.py`
-- [x] Add alignment-aware source distributions beyond Gaussian/reference COM (e.g., rigidly perturbed reference-driven prior).
-- [x] Add harmonic prior relaxation and optional source-target Kabsch alignment.
+- [ ] Add alignment-aware source distributions beyond Gaussian/reference COM (e.g., rigidly perturbed reference-driven prior).
 - [ ] Add alternative path families and ablation flags.
 - [ ] Add robust weighting / curriculum over time samples.
 
 ### `sampler.py`
 - [ ] Add adaptive-step ODE solver option.
-- [x] Implement pocket-aware UFF-gradient guidance backend (`--guidance-backend uff`).
+- [ ] Implement UFF/pocket guidance with predictor-corrector stability safeguards.
 - [ ] Add trajectory logging for debugging stiff dynamics.
 
 ### `train.py`
@@ -131,7 +116,7 @@ python -m etflowalign.inference --help
 - [ ] Add distributed and mixed-precision training support.
 
 ### `inference.py`
-- [x] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
+- [ ] Replace toy ranker with pluggable TanimotoCombo + docking/physics rank adaptor.
 - [ ] Add batch inference over benchmark sets and structured output export.
 - [ ] Add reranking ensemble hooks.
 
