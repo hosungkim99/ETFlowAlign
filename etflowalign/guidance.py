@@ -6,6 +6,8 @@ import importlib
 import importlib.util
 from dataclasses import dataclass
 from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import Tensor
