@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .model import AlignmentBatch, ETFlowAlignModel
+from .utils import segment_mean
 
 
 @dataclass
@@ -61,6 +62,7 @@ class AlignmentFlowMatcher:
             - gaussian: isotropic Gaussian source.
             - query_perturbed: perturb target with Gaussian noise.
             - reference_anchored: sample around reference center of mass.
+            - rigid_reference_perturbed: rigid perturb reference pose (alignment-aware prior).
         """
         stype = self.config.source_type
         if stype == "gaussian":
@@ -95,6 +97,9 @@ class AlignmentFlowMatcher:
         """
         t_node = t_graph[batch.query_batch]
         x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
+        x0 = self._apply_harmonic_prior_if_needed(x0=x0, batch=batch)
+        if self.config.use_kabsch_alignment:
+            x0 = self._kabsch_align_source_to_target(x0=x0, target_query_pos=target_query_pos, batch_index=batch.query_batch)
         eps = torch.randn_like(target_query_pos)
 
         sigma = self.sigma_t(t_node).unsqueeze(-1)

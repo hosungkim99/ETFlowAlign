@@ -25,6 +25,9 @@ class ODESamplerConfig:
         guidance_scale: Global multiplier for external guidance.
         guidance_mode: How guidance is injected.
         max_guidance_norm: Per-atom norm cap for guidance vectors.
+        pc_corrector_step_scale: Step scale for predictor-corrector correction.
+        adaptive_dt: Enable simple adaptive step scaling by velocity norm.
+        adaptive_dt_max_scale: Maximum multiplier for adaptive dt.
     """
     n_steps: int = 50
     t_start: float = 0.0
@@ -33,6 +36,12 @@ class ODESamplerConfig:
     guidance_scale: float = 0.0
     guidance_mode: Literal["vector_field", "predictor_corrector"] = "vector_field"
     max_guidance_norm: float = 5.0
+    pc_corrector_step_scale: float = 1.0
+    adaptive_dt: bool = False
+    adaptive_dt_min_scale: float = 0.1
+    adaptive_dt_max_scale: float = 2.0
+    log_trajectory: bool = False
+    max_trace_steps: int = 2000
 
 
 class ETFlowAlignSampler:

@@ -13,6 +13,8 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
+from .utils import safe_norm, segment_mean
+
 
 @dataclass
 class AlignmentBatch:
@@ -35,6 +37,8 @@ class AlignmentBatch:
     reference_atom_type: Optional[Tensor] = None
     reference_batch: Optional[Tensor] = None
     pocket_pos: Optional[Tensor] = None
+    query_node_attr: Optional[Tensor] = None
+    reference_node_attr: Optional[Tensor] = None
 
 
 class SimpleTimeEmbedding(nn.Module):
@@ -163,6 +167,68 @@ class EquivariantBlock(nn.Module):
         m = torch.zeros_like(h)
         m.index_add_(0, i, e_ij)
         h = h + self.phi_h(torch.cat([h, m], dim=-1))
+        return h, x
+
+
+class TorchMDEquivariantTransformerBlock(nn.Module):
+    """TorchMD-NET style lightweight equivariant transformer block."""
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4) -> None:
+        super().__init__()
+        self.num_heads = int(max(1, num_heads))
+        self.head_dim = hidden_dim // self.num_heads
+        if self.head_dim == 0 or self.head_dim * self.num_heads != hidden_dim:
+            raise ValueError("hidden_dim must be divisible by num_heads for torchmd_et backbone.")
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.dist_proj = nn.Sequential(nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, self.num_heads))
+        self.coord_gate = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(nn.Linear(hidden_dim, hidden_dim * 2), nn.SiLU(), nn.Linear(hidden_dim * 2, hidden_dim))
+
+    def forward(self, h: Tensor, x: Tensor, edge_index: Tensor) -> tuple[Tensor, Tensor]:
+        if edge_index.numel() == 0:
+            return h, x
+
+        i, j = edge_index[0], edge_index[1]
+        rij = x[i] - x[j]
+        dij = torch.norm(rij, dim=-1, keepdim=True).clamp_min(1e-8)
+
+        q = self.q_proj(h).view(h.size(0), self.num_heads, self.head_dim)
+        k = self.k_proj(h).view(h.size(0), self.num_heads, self.head_dim)
+        v = self.v_proj(h).view(h.size(0), self.num_heads, self.head_dim)
+
+        q_i = q[i]
+        k_j = k[j]
+        v_j = v[j]
+        dist_bias = self.dist_proj(dij)  # [E, heads]
+        attn_logits = (q_i * k_j).sum(dim=-1) / (self.head_dim**0.5) + dist_bias
+
+        # Segment softmax over incoming edges for each destination node i.
+        attn = torch.zeros_like(attn_logits)
+        n_nodes = h.size(0)
+        for node in range(n_nodes):
+            mask = i == node
+            if mask.any():
+                attn[mask] = torch.softmax(attn_logits[mask], dim=0)
+
+        msg = attn.unsqueeze(-1) * v_j
+        agg = torch.zeros(h.size(0), self.num_heads, self.head_dim, device=h.device, dtype=h.dtype)
+        agg.index_add_(0, i, msg)
+        agg = agg.reshape(h.size(0), -1)
+
+        h = h + self.o_proj(agg)
+        h = self.norm(h + self.ffn(h))
+
+        # Equivariant coordinate update from attended scalar messages.
+        gate = self.coord_gate(agg[i])
+        dx_msg = gate * (rij / dij)
+        dx = torch.zeros_like(x)
+        dx.index_add_(0, i, dx_msg)
+        x = x + dx
         return h, x
 
 

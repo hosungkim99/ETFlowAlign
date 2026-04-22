@@ -6,6 +6,9 @@ This module re-exports the main classes/functions so users can import from
 
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig, flow_matching_step
 from .inference import generate_candidates, rank_candidates
+from .guidance import UFFGuidanceConfig, UFFPocketGuidance
+from .inference import generate_candidates, rank_candidates
+from .rankers import LegacyReferenceMseRanker, PluginRanker, RankBreakdown, RankerConfig
 from .model import AlignmentBatch, ETFlowAlignModel
 from .sampler import ETFlowAlignSampler, ODESamplerConfig
 from .train import TrainConfig, build_training_components, train_step
@@ -16,6 +19,12 @@ __all__ = [
     "ETFlowAlignModel",
     "ETFlowAlignSampler",
     "FlowMatchingConfig",
+    "UFFGuidanceConfig",
+    "UFFPocketGuidance",
+    "LegacyReferenceMseRanker",
+    "PluginRanker",
+    "RankBreakdown",
+    "RankerConfig",
     "ODESamplerConfig",
     "TrainConfig",
     "build_training_components",

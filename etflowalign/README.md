@@ -134,8 +134,27 @@ python -m etflowalign.train \
   --steps 200 \
   --batch-size 8 \
   --n-atoms 16 \
+  --backbone-type torchmd_et \
+  --num-heads 4 \
+  --harmonic-prior-strength 0.05 \
   --save-path etflowalign_ckpt.pt
 ```
+
+### Train (real task batch file)
+
+```bash
+python -m etflowalign.train \
+  --train-data /path/to/train_batch.pt \
+  --val-data /path/to/val_batch.pt \
+  --val-every 20 \
+  --use-scheduler \
+  --save-path etflowalign_ckpt.pt
+```
+
+Real-task `.pt` batch expected keys:
+- required: `query_pos`, `query_atom_type`, `query_batch`, `target_query_pos`
+- optional: `reference_pos`, `reference_atom_type`, `reference_batch`, `pocket_pos`,
+  `query_node_attr`, `reference_node_attr`
 
 ### Inference (from trained checkpoint)
 
@@ -145,7 +164,28 @@ python -m etflowalign.inference \
   --num-samples 16 \
   --n-steps 64 \
   --solver heun \
+  --guidance-backend uff \
   --guidance-scale 0.2 \
   --use-pocket-guidance \
   --save-path etflowalign_samples.pt
 ```
+
+### Inference (real task batch file)
+
+```bash
+python -m etflowalign.inference \
+  --checkpoint etflowalign_ckpt.pt \
+  --input-batch /path/to/infer_batch.pt \
+  --num-samples 32 \
+  --top-k 8 \
+  --adaptive-dt \
+  --save-path etflowalign_samples.pt
+```
+
+
+### Ranking backend notes
+
+- `--ranker plugin_combo` (default): combines a TanimotoCombo-like proxy score and docking/physics proxy score.
+- `--ranker legacy_reference_mse`: compatibility mode using the old negative-reference-MSE score.
+- Saved inference artifacts now include `component_scores` (`tanimoto`, `physics`) plus ranker metadata.
+- For production use, inject external plugin callbacks (e.g., ROCS/OpenEye + docking engine) through `PluginRanker`.
