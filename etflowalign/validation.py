@@ -44,15 +44,10 @@ def validate_alignment_batch(
         raise ValueError("query_pos, query_atom_type, query_batch must share first dimension Nq.")
     if not torch.is_floating_point(qpos):
         raise ValueError("query_pos must be floating point.")
-    if qtype.dtype != torch.long:
-        raise ValueError("query_atom_type must be torch.long.")
-    if qbatch.dtype != torch.long:
-        raise ValueError("query_batch must be torch.long.")
-
-    if batch.query_node_attr is not None:
-        _check_shape("query_node_attr", batch.query_node_attr, rank=2)
-        if batch.query_node_attr.size(0) != qpos.size(0):
-            raise ValueError("query_node_attr must have first dimension Nq.")
+    if qtype.dtype not in (torch.int32, torch.int64):
+        raise ValueError("query_atom_type must be int32 or int64.")
+    if qbatch.dtype not in (torch.int32, torch.int64):
+        raise ValueError("query_batch must be int32 or int64.")
 
     if require_reference or batch.reference_pos is not None or batch.reference_batch is not None:
         rpos = _require_tensor("reference_pos", batch.reference_pos)
@@ -61,24 +56,6 @@ def validate_alignment_batch(
         _check_shape("reference_batch", rbatch, rank=1)
         if rpos.size(0) != rbatch.size(0):
             raise ValueError("reference_pos and reference_batch must share first dimension Nr.")
-        if rbatch.dtype != torch.long:
-            raise ValueError("reference_batch must be torch.long.")
-
-    if batch.reference_atom_type is not None:
-        _check_shape("reference_atom_type", batch.reference_atom_type, rank=1)
-        if batch.reference_pos is None:
-            raise ValueError("reference_atom_type provided but reference_pos is missing.")
-        if batch.reference_atom_type.size(0) != batch.reference_pos.size(0):
-            raise ValueError("reference_atom_type must have first dimension Nr.")
-        if batch.reference_atom_type.dtype != torch.long:
-            raise ValueError("reference_atom_type must be torch.long.")
-
-    if batch.reference_node_attr is not None:
-        _check_shape("reference_node_attr", batch.reference_node_attr, rank=2)
-        if batch.reference_pos is None:
-            raise ValueError("reference_node_attr provided but reference_pos is missing.")
-        if batch.reference_node_attr.size(0) != batch.reference_pos.size(0):
-            raise ValueError("reference_node_attr must have first dimension Nr.")
 
     pocket_pos = batch.pocket_pos
     pocket_batch = getattr(batch, "pocket_batch", None)
@@ -89,8 +66,6 @@ def validate_alignment_batch(
         _check_shape("pocket_batch", pbatch, rank=1)
         if ppos.size(0) != pbatch.size(0):
             raise ValueError("pocket_pos and pocket_batch must share first dimension Np.")
-        if pbatch.dtype != torch.long:
-            raise ValueError("pocket_batch must be torch.long.")
 
     if require_target:
         target_query_pos = _require_tensor("target_query_pos", target_query_pos)

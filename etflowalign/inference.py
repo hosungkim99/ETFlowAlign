@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
@@ -66,8 +66,7 @@ def run_inference(args: argparse.Namespace) -> None:
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    flow_args = ckpt.get("flow_args", {})
-    flow_matcher = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
+    flow_matcher = AlignmentFlowMatcher(FlowMatchingConfig(**ckpt.get("flow_args", {})))
     sampler = ETFlowAlignSampler(
         model=model,
         config=ODESamplerConfig(
@@ -79,11 +78,10 @@ def run_inference(args: argparse.Namespace) -> None:
         ),
     )
 
-    input_metadata: dict[str, Any] = {}
     if args.synthetic_smoke:
         batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
     else:
-        batch, _, input_metadata = load_alignment_batch_from_pt(args.input_batch, require_target=False, device=device)
+        batch, _, _ = load_alignment_batch_from_pt(args.input_batch, require_target=False, device=device)
 
     candidates = generate_candidates(
         sampler=sampler,
@@ -96,22 +94,6 @@ def run_inference(args: argparse.Namespace) -> None:
 
     print(f"[inference] candidates={ranked.shape}")
     print(f"[inference] top_score={scores[0].item():.6f}")
-
-    if args.save_path:
-        run_metadata = {
-            "checkpoint": args.checkpoint,
-            "input_batch": args.input_batch,
-            "synthetic_smoke": bool(args.synthetic_smoke),
-            "num_samples": int(args.num_samples),
-            "n_steps": int(args.n_steps),
-            "solver": args.solver,
-            "guidance_scale": float(args.guidance_scale),
-            "guidance_mode": args.guidance_mode,
-            "source_type": flow_args.get("source_type"),
-            "input_metadata": input_metadata,
-        }
-        torch.save({"candidates": ranked.cpu(), "scores": scores.cpu(), "metadata": run_metadata}, args.save_path)
-        print(f"[inference] saved to: {args.save_path}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -129,7 +111,6 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--synthetic-smoke", action="store_true")
     p.add_argument("--input-batch", type=str, default="")
-    p.add_argument("--save-path", type=str, default="")
     return p
 
 

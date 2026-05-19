@@ -41,9 +41,7 @@ class AlignmentFlowMatcher:
         stype = self.config.source_type
         if stype == "gaussian":
             return torch.randn_like(batch.query_pos)
-        if stype == "query_perturbed":
-            if target_query_pos is None:
-                raise ValueError("source_type='query_perturbed' requires target_query_pos.")
+        if stype == "query_perturbed" and target_query_pos is not None:
             return target_query_pos + self.config.source_noise_scale * torch.randn_like(target_query_pos)
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
             return torch.randn_like(batch.query_pos)
@@ -86,26 +84,15 @@ class AlignmentFlowMatcher:
         center = center / count.clamp_min(1.0)
         return x0 - self.config.harmonic_prior_strength * (x0 - center[batch.query_batch])
 
-    def _center_by_graph(self, x: Tensor, batch_index: Tensor) -> Tensor:
-        num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 0
-        if num_graphs == 0:
-            return x
-        mean = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
-        count = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
-        mean.index_add_(0, batch_index, x)
-        count.index_add_(0, batch_index, torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype))
-        mean = mean / count.clamp_min(1.0)
-        return x - mean[batch_index]
-
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         validate_alignment_batch(batch, target_query_pos=target_query_pos, require_target=True)
         t_node = t_graph[batch.query_batch]
         x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
         if self.config.center_source:
-            x0 = self._center_by_graph(x0, batch.query_batch)
+            x0 = x0 - x0.mean(dim=0, keepdim=True)
         x1 = target_query_pos
         if self.config.center_target:
-            x1 = self._center_by_graph(x1, batch.query_batch)
+            x1 = x1 - x1.mean(dim=0, keepdim=True)
         x0 = self._apply_harmonic_prior_if_needed(x0=x0, batch=batch)
         if self.config.use_kabsch_alignment:
             x0 = self._kabsch_align_source_to_target(x0=x0, target_query_pos=x1, batch_index=batch.query_batch)
