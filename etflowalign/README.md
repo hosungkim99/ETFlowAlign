@@ -21,6 +21,8 @@ ETFlowAlign keeps the DiffAlign task framing, but swaps diffusion reverse dynami
 python -m etflowalign.train --synthetic-smoke --steps 2 --batch-size 2 --n-atoms 8 --save-path /tmp/etflowalign_smoke.pt
 python -m etflowalign.inference --synthetic-smoke --checkpoint /tmp/etflowalign_smoke.pt --num-samples 4 --n-steps 8
 ```
+`infer_batch.pt` must include: `query_pos`, `query_atom_type`, `query_batch`.
+`target_query_pos` is not required.
 
 ### Real `.pt` batch training
 ```bash
