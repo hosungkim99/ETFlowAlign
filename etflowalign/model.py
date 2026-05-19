@@ -37,6 +37,7 @@ class AlignmentBatch:
     reference_atom_type: Optional[Tensor] = None
     reference_batch: Optional[Tensor] = None
     pocket_pos: Optional[Tensor] = None
+    pocket_batch: Optional[Tensor] = None
     query_node_attr: Optional[Tensor] = None
     reference_node_attr: Optional[Tensor] = None
 

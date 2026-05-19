@@ -75,7 +75,7 @@ class ETFlowAlignSampler:
         )
         return self.model(cur, t_graph=t_graph)
 
-    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> Tensor:
+    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn], dt: Tensor | None = None) -> Tensor:
         """Apply optional external guidance based on configured mode.
 
         Returns:
@@ -99,7 +99,9 @@ class ETFlowAlignSampler:
             return x, v + self.config.guidance_scale * g
 
         # predictor-corrector style: update state separately by guidance.
-        x = x + (self.config.guidance_scale / max(1, self.config.n_steps)) * g
+        if dt is None:
+            raise ValueError("predictor_corrector guidance requires dt.")
+        x = x + self.config.pc_corrector_step_scale * self.config.guidance_scale * dt * g
         return x, v
 
     @torch.no_grad()
@@ -124,7 +126,7 @@ class ETFlowAlignSampler:
             t_graph = torch.full((num_graphs,), float(t), device=x.device)
 
             v = self._model_v(batch, x, t_graph)
-            x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn)
+            x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn, dt=dt)
 
             if self.config.solver == "euler":
                 x = x + dt * v
@@ -132,6 +134,9 @@ class ETFlowAlignSampler:
                 x_pred = x + dt * v
                 t_next = torch.full((num_graphs,), float(t_grid[i + 1]), device=x.device)
                 v_next = self._model_v(batch, x_pred, t_next)
+                x_pred_for_guidance, v_next = self._apply_guidance(batch, x_pred, t_next, v_next, guidance_fn, dt=dt)
+                if self.config.guidance_mode == "predictor_corrector":
+                    x_pred = x_pred_for_guidance
                 x = x + 0.5 * dt * (v + v_next)
 
             if not torch.isfinite(x).all():
