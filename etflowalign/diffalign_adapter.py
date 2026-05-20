@@ -16,22 +16,7 @@ from rdkit import Chem
 from rdkit.Geometry import Point3D
 from torch import Tensor
 from torch_geometric.data import Batch
-
-
-def add_diffalign_to_pythonpath(repo_root: str | Path) -> None:
-    """Add external DiffAlign package path to sys.path if needed."""
-    import sys
-
-    repo_root = Path(repo_root).resolve()
-    diffalign_pkg_root = repo_root / "external" / "diffalign" / "diffalign"
-
-    if not diffalign_pkg_root.exists():
-        raise FileNotFoundError(f"DiffAlign package root not found: {diffalign_pkg_root}")
-
-    path_str = str(diffalign_pkg_root)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-
+from torch_geometric.data import Data
 
 def load_rdkit_mol(path: str | Path, *, sanitize: bool = True, remove_hs: bool = True) -> Chem.Mol:
     """Load RDKit molecule from SDF/MOL/PDB based on file extension."""
@@ -66,7 +51,70 @@ def rdkit_mol_to_pos(mol: Chem.Mol) -> Tensor:
 
     return torch.tensor(coords, dtype=torch.float32)
 
+def _bond_type_to_int(bond: Chem.Bond) -> int:
+    bond_type = bond.GetBondType()
 
+    if bond_type == Chem.rdchem.BondType.SINGLE:
+        return 1
+    if bond_type == Chem.rdchem.BondType.DOUBLE:
+        return 2
+    if bond_type == Chem.rdchem.BondType.TRIPLE:
+        return 3
+    if bond_type == Chem.rdchem.BondType.AROMATIC:
+        return 12
+
+    raise ValueError(f"Unsupported bond type: {bond_type}")
+
+
+def mol_to_graph_data_obj_local(mol: Chem.Mol) -> Data:
+    """Local copy of DiffAlign's RDKit Mol -> PyG Data conversion.
+
+    Output fields:
+        atom_type: Tensor[N], atomic number
+        edge_index: Tensor[2, 2E], directed bond edges
+        edge_type: Tensor[2E], bond type as float
+        pos: Tensor[N, 3], conformer coordinates
+    """
+    atom_features = []
+    for atom in mol.GetAtoms():
+        atom_features.append(atom.GetAtomicNum())
+
+    atom_type = torch.tensor(atom_features, dtype=torch.long)
+
+    edges = []
+    bond_types = []
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        bond_type = _bond_type_to_int(bond)
+
+        edges.append((i, j))
+        bond_types.append(bond_type)
+        edges.append((j, i))
+        bond_types.append(bond_type)
+
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        edge_type = torch.tensor(bond_types, dtype=torch.float32).view(-1)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_type = torch.empty((0,), dtype=torch.float32)
+
+    conf = mol.GetConformer()
+    coordinates = []
+    for atom in mol.GetAtoms():
+        pos = conf.GetAtomPosition(atom.GetIdx())
+        coordinates.append([pos.x, pos.y, pos.z])
+
+    pos = torch.tensor(coordinates, dtype=torch.float32)
+
+    return Data(
+        atom_type=atom_type,
+        edge_index=edge_index,
+        edge_type=edge_type,
+        pos=pos,
+    )
+    
 def shift_rdkit_mol_inplace(mol: Chem.Mol, shift: Tensor) -> Chem.Mol:
     """Shift RDKit conformer coordinates in-place by subtracting shift."""
     shift = shift.detach().cpu().float()
@@ -164,9 +212,6 @@ def build_diffalign_example_inference_payload(
     - query coordinates may be randomized with N(0,I).
     """
     repo_root = Path(repo_root).resolve()
-    add_diffalign_to_pythonpath(repo_root)
-
-    from diffalign.utils.chem import mol_to_graph_data_obj
 
     query_mol = load_rdkit_mol(query_sdf, sanitize=True, remove_hs=True)
     reference_mol = load_rdkit_mol(reference_sdf, sanitize=True, remove_hs=True)
@@ -175,8 +220,8 @@ def build_diffalign_example_inference_payload(
     if pocket_pdb is not None:
         pocket_mol = load_rdkit_mol(pocket_pdb, sanitize=True, remove_hs=True)
 
-    query_data = mol_to_graph_data_obj(query_mol)
-    reference_data = mol_to_graph_data_obj(reference_mol)
+    query_data = mol_to_graph_data_obj_local(query_mol)
+    reference_data = mol_to_graph_data_obj_local(reference_mol)
 
     reference_mean = reference_data.pos.mean(dim=0)
     reference_data.pos = reference_data.pos - reference_mean
