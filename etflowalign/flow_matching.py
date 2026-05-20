@@ -38,30 +38,30 @@ class AlignmentFlowMatcher:
         return self.config.sigma * 0.5 * (1.0 - 2.0 * t_node) / denom
 
     def sample_source(self, batch: AlignmentBatch, target_query_pos: Tensor | None = None) -> Tensor:
-    stype = self.config.source_type
+        stype = self.config.source_type
 
-    if stype == "gaussian":
-        return torch.randn_like(batch.query_pos)
+        if stype == "gaussian":
+            return torch.randn_like(batch.query_pos)
 
-    if stype == "query_perturbed":
-        if target_query_pos is None:
-            raise ValueError("source_type='query_perturbed' requires target_query_pos.")
-        return target_query_pos + self.config.source_noise_scale * torch.randn_like(target_query_pos)
+        if stype == "query_perturbed":
+            if target_query_pos is None:
+                raise ValueError("source_type='query_perturbed' requires target_query_pos.")
+            return target_query_pos + self.config.source_noise_scale * torch.randn_like(target_query_pos)
 
-    if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
-        return torch.randn_like(batch.query_pos)
+        if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
+            return torch.randn_like(batch.query_pos)
 
-    num_graphs = int(batch.reference_batch.max().item()) + 1
-    center = torch.zeros(num_graphs, 3, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
-    count = torch.zeros(num_graphs, 1, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
-    center.index_add_(0, batch.reference_batch, batch.reference_pos)
-    count.index_add_(
-        0,
-        batch.reference_batch,
-        torch.ones_like(batch.reference_batch, dtype=batch.reference_pos.dtype).unsqueeze(-1),
-    )
-    center = center / count.clamp_min(1.0)
-    return center[batch.query_batch] + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
+        num_graphs = int(batch.reference_batch.max().item()) + 1
+        center = torch.zeros(num_graphs, 3, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
+        count = torch.zeros(num_graphs, 1, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
+        center.index_add_(0, batch.reference_batch, batch.reference_pos)
+        count.index_add_(
+            0,
+            batch.reference_batch,
+            torch.ones_like(batch.reference_batch, dtype=batch.reference_pos.dtype).unsqueeze(-1),
+        )
+        center = center / count.clamp_min(1.0)
+        return center[batch.query_batch] + self.config.source_noise_scale * torch.randn_like(batch.query_pos)
 
     def _kabsch_align_source_to_target(self, x0: Tensor, target_query_pos: Tensor, batch_index: Tensor) -> Tensor:
         out = x0.clone()
@@ -95,23 +95,23 @@ class AlignmentFlowMatcher:
         return x0 - self.config.harmonic_prior_strength * (x0 - center[batch.query_batch])
     
     def _center_by_graph(self, x: Tensor, batch_index: Tensor) -> Tensor:
-    num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 0
-    if num_graphs == 0:
-        return x
+        num_graphs = int(batch_index.max().item()) + 1 if batch_index.numel() else 0
+        if num_graphs == 0:
+            return x
 
-    mean = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
-    count = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
+        mean = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
+        count = torch.zeros(num_graphs, 1, device=x.device, dtype=x.dtype)
 
-    mean.index_add_(0, batch_index, x)
-    count.index_add_(
-        0,
-        batch_index,
-        torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype),
-    )
+        mean.index_add_(0, batch_index, x)
+        count.index_add_(
+            0,
+            batch_index,
+            torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype),
+        )
 
-    mean = mean / count.clamp_min(1.0)
-    return x - mean[batch_index]
-    
+        mean = mean / count.clamp_min(1.0)
+        return x - mean[batch_index]
+        
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         validate_alignment_batch(batch, target_query_pos=target_query_pos, require_target=True)
         t_node = t_graph[batch.query_batch]
