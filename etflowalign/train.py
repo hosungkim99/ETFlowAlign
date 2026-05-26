@@ -8,7 +8,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor, optim
@@ -81,15 +83,30 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 def run_training(args: argparse.Namespace) -> None:
     """CLI training entrypoint."""
     device = torch.device(args.device)
-    model = ETFlowAlignModel(hidden_dim=args.hidden_dim, num_blocks=args.num_blocks).to(device)
+    model = ETFlowAlignModel(
+        hidden_dim=args.hidden_dim,
+        num_blocks=args.num_blocks,
+        use_atom_index_embed=args.use_atom_index_embed,
+        use_direct_vector_head=args.use_direct_vector_head,
+        max_atoms=args.max_atoms,
+    ).to(device)
 
     fm_config = FlowMatchingConfig(
         sigma=args.sigma,
         source_type=args.source_type,
         source_noise_scale=args.source_noise_scale,
+        center_source=args.center_source,
+        center_target=args.center_target,
+        use_kabsch_alignment=args.use_kabsch_alignment,
+        fixed_t=args.fixed_t,
     )
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
+
+    best_loss = float("inf")
+    best_step = -1
+    best_model_state: dict[str, torch.Tensor] | None = None
+    final_loss = float("nan")
 
     for step in range(1, args.steps + 1):
         if args.synthetic_smoke:
@@ -104,9 +121,27 @@ def run_training(args: argparse.Namespace) -> None:
 
         loss = train_step(model, matcher, optimizer, batch, target_query_pos)
         if step % args.log_every == 0 or step == 1:
-            print(f"[train] step={step:04d} loss={loss:.6f}")
+            print(f"[train] step={step:04d} loss={final_loss:.6f}")
 
-    ckpt = {
+    model_args = {
+        "hidden_dim": args.hidden_dim,
+        "num_blocks": args.num_blocks,
+        "use_atom_index_embed": args.use_atom_index_embed,
+        "use_direct_vector_head": args.use_direct_vector_head,
+        "max_atoms": args.max_atoms,
+    }
+    flow_args = {
+        "sigma": args.sigma,
+        "source_type": args.source_type,
+        "source_noise_scale": args.source_noise_scale,
+        "center_source": args.center_source,
+        "center_target": args.center_target,
+        "use_kabsch_alignment": args.use_kabsch_alignment,
+        "fixed_t": args.fixed_t,
+    }
+    train_args = vars(args).copy()
+
+    final_ckpt = {
         "model_state": model.state_dict(),
         "model_args": {"hidden_dim": args.hidden_dim, "num_blocks": args.num_blocks},
         "flow_args": {
@@ -115,8 +150,10 @@ def run_training(args: argparse.Namespace) -> None:
             "source_noise_scale": args.source_noise_scale,
         },
     }
-    torch.save(ckpt, args.save_path)
+    torch.save(best_ckpt, best_path)
+
     print(f"[train] checkpoint saved to: {args.save_path}")
+    print(f"[train] best checkpoint saved to: {best_path} at step={best_step} loss={best_loss:.6f}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -138,6 +175,21 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["gaussian", "reference_anchored", "query_perturbed"],
     )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
+    p.add_argument("--use-atom-index-embed", action="store_true")
+    p.add_argument("--use-direct-vector-head", action="store_true")
+    p.add_argument("--max-atoms", type=int, default=256)
+
+    p.add_argument("--center-source", dest="center_source", action="store_true")
+    p.add_argument("--no-center-source", dest="center_source", action="store_false")
+    p.set_defaults(center_source=True)
+    p.add_argument("--center-target", dest="center_target", action="store_true")
+    p.add_argument("--no-center-target", dest="center_target", action="store_false")
+    p.set_defaults(center_target=True)
+    p.add_argument("--use-kabsch-alignment", dest="use_kabsch_alignment", action="store_true")
+    p.add_argument("--no-use-kabsch-alignment", dest="use_kabsch_alignment", action="store_false")
+    p.set_defaults(use_kabsch_alignment=True)
+    p.add_argument("--fixed-t", type=float, default=None)
+
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-path", type=str, default="etflowalign_ckpt.pt")
 

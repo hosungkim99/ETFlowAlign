@@ -244,17 +244,27 @@ class ETFlowAlignModel(nn.Module):
         num_blocks: int = 4,
         edge_cutoff: float = 6.0,
         max_neighbors: int = 32,
+        use_atom_index_embed: bool = False,
+        use_direct_vector_head: bool = False,
+        max_atoms: int = 256,
     ) -> None:
         super().__init__()
         self.edge_cutoff = float(edge_cutoff)
         self.max_neighbors = int(max_neighbors)
 
         self.atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
+        self.use_atom_index_embed = bool(use_atom_index_embed)
+        self.use_direct_vector_head = bool(use_direct_vector_head)
+        self.max_atoms = int(max_atoms)
+        if self.use_atom_index_embed:
+            self.atom_index_embed = nn.Embedding(self.max_atoms, hidden_dim)
         self.time_embed = SimpleTimeEmbedding(time_embed_dim)
         self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4, hidden_dim)
 
         self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
         self.out_gate = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        if self.use_direct_vector_head:
+            self.out_vec = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 3))
 
     def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor]:
         """Return direction and distance from query atoms to reference center."""
@@ -287,6 +297,15 @@ class ETFlowAlignModel(nn.Module):
         x = batch.query_pos - com[batch.query_batch]  # Translation-invariant coordinates.
 
         h_atom = self.atom_embed(batch.query_atom_type)  # Atom identity features.
+        if self.use_atom_index_embed:
+            local_index = torch.zeros_like(batch.query_batch)
+            for g in batch.query_batch.unique(sorted=True):
+                mask = batch.query_batch == g
+                n = int(mask.sum().item())
+                local_index[mask] = torch.arange(n, device=batch.query_batch.device, dtype=batch.query_batch.dtype)
+            if int(local_index.max().item()) >= self.max_atoms:
+                raise ValueError(f"local atom index exceeds max_atoms={self.max_atoms}; increase --max-atoms.")
+            h_atom = h_atom + self.atom_index_embed(local_index)
         h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
         ref_dir, ref_dist = self._reference_context(batch)  # Conditioning from reference geometry.
         h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))  # Initial node states.
@@ -294,6 +313,9 @@ class ETFlowAlignModel(nn.Module):
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
         for block in self.blocks:
             h, x = block(h, x, edge_index)
+
+        if self.use_direct_vector_head:
+            return self.out_vec(h)
 
         gate = self.out_gate(h)  # Scalar gate per atom.
         v = gate * x  # Vector field aligned with equivariant coordinate features.

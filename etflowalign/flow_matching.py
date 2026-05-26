@@ -14,7 +14,7 @@ from .validation import validate_alignment_batch
 @dataclass
 class FlowMatchingConfig:
     sigma: float = 0.05
-    source_type: Literal["gaussian", "reference_anchored", "query_perturbed"] = "reference_anchored"
+    source_type: Literal["gaussian", "reference_anchored", "query_perturbed", "input_query"] = "reference_anchored"
     source_noise_scale: float = 0.5
     time_eps: float = 1e-4
     use_kabsch_alignment: bool = True
@@ -50,7 +50,6 @@ class AlignmentFlowMatcher:
 
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
             return torch.randn_like(batch.query_pos)
-
         num_graphs = int(batch.reference_batch.max().item()) + 1
         center = torch.zeros(num_graphs, 3, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
         count = torch.zeros(num_graphs, 1, device=batch.reference_pos.device, dtype=batch.reference_pos.dtype)
