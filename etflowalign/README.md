@@ -36,6 +36,31 @@ python -m etflowalign.inference --checkpoint /tmp/etflowalign_ckpt.pt --input-ba
 ```
 `infer_batch.pt` must include: `query_pos`, `query_atom_type`, `query_batch`. `target_query_pos` is not required.
 
+
+### Debug overfit sanity result
+
+- Batch: DiffAlign example pseudo train batch
+- Source: input_query
+- Target: query_sdf_conformer_minus_reference_center
+- Model mode:
+  - use_atom_index_embed=True
+  - use_direct_vector_head=True
+- Flow:
+  - sigma=0.0
+  - center_source=False
+  - center_target=False
+  - use_kabsch_alignment=False
+- fixed_t=0.5:
+  - best_loss ≈ 4.4e-08
+  - t=0.5 RMSE ≈ 0.0002 Å
+- random t:
+  - best_loss ≈ 0.0030
+  - all-t diagnostic RMSE < 0.5 Å
+- inference/SDF:
+  - atomwise RMSD to query_original ≈ 0.213 Å
+  - COM distance ≈ 0.062 Å
+  - bond length mean ≈ 1.455 Å
+
 ## v0.1 interface notes
 - `GuidanceFn` must return `Tensor[Nq, 3]` exactly.
 - Ranking currently validates and supports one complex per inference call.
