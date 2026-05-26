@@ -8,7 +8,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor, optim
@@ -101,6 +103,11 @@ def run_training(args: argparse.Namespace) -> None:
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
 
+    best_loss = float("inf")
+    best_step = -1
+    best_model_state: dict[str, torch.Tensor] | None = None
+    final_loss = float("nan")
+
     for step in range(1, args.steps + 1):
         if args.synthetic_smoke:
             batch, target_query_pos = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
@@ -113,30 +120,64 @@ def run_training(args: argparse.Namespace) -> None:
             assert target_query_pos is not None
 
         loss = train_step(model, matcher, optimizer, batch, target_query_pos)
-        if step % args.log_every == 0 or step == 1:
-            print(f"[train] step={step:04d} loss={loss:.6f}")
+        final_loss = float(loss)
+        if not math.isfinite(final_loss):
+            raise FloatingPointError(f"Non-finite loss at step={step}: {final_loss}")
 
-    ckpt = {
-        "model_state": model.state_dict(),
-        "model_args": {
-            "hidden_dim": args.hidden_dim,
-            "num_blocks": args.num_blocks,
-            "use_atom_index_embed": args.use_atom_index_embed,
-            "use_direct_vector_head": args.use_direct_vector_head,
-            "max_atoms": args.max_atoms,
-        },
-        "flow_args": {
-            "sigma": args.sigma,
-            "source_type": args.source_type,
-            "source_noise_scale": args.source_noise_scale,
-            "center_source": args.center_source,
-            "center_target": args.center_target,
-            "use_kabsch_alignment": args.use_kabsch_alignment,
-            "fixed_t": args.fixed_t,
-        },
+        if final_loss < best_loss:
+            best_loss = final_loss
+            best_step = step
+            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if step % args.log_every == 0 or step == 1:
+            print(f"[train] step={step:04d} loss={final_loss:.6f}")
+
+    model_args = {
+        "hidden_dim": args.hidden_dim,
+        "num_blocks": args.num_blocks,
+        "use_atom_index_embed": args.use_atom_index_embed,
+        "use_direct_vector_head": args.use_direct_vector_head,
+        "max_atoms": args.max_atoms,
     }
-    torch.save(ckpt, args.save_path)
+    flow_args = {
+        "sigma": args.sigma,
+        "source_type": args.source_type,
+        "source_noise_scale": args.source_noise_scale,
+        "center_source": args.center_source,
+        "center_target": args.center_target,
+        "use_kabsch_alignment": args.use_kabsch_alignment,
+        "fixed_t": args.fixed_t,
+    }
+    train_args = vars(args).copy()
+
+    final_ckpt = {
+        "model_state": model.state_dict(),
+        "model_args": model_args,
+        "flow_args": flow_args,
+        "train_args": train_args,
+        "final_loss": final_loss,
+        "best_loss": best_loss,
+        "best_step": best_step,
+    }
+    torch.save(final_ckpt, args.save_path)
+
+    if best_model_state is None:
+        raise RuntimeError("best_model_state is missing despite finite training loop.")
+
+    save_path = Path(args.save_path)
+    best_path = str(save_path.with_name(f"{save_path.stem}_best.pt"))
+    best_ckpt = {
+        "model_state": best_model_state,
+        "model_args": model_args,
+        "flow_args": flow_args,
+        "train_args": train_args,
+        "best_loss": best_loss,
+        "best_step": best_step,
+    }
+    torch.save(best_ckpt, best_path)
+
     print(f"[train] checkpoint saved to: {args.save_path}")
+    print(f"[train] best checkpoint saved to: {best_path} at step={best_step} loss={best_loss:.6f}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
