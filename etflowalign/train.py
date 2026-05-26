@@ -172,7 +172,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--source-type",
         type=str,
         default="reference_anchored",
-        choices=["gaussian", "reference_anchored", "query_perturbed"],
+        choices=["gaussian", "reference_anchored", "query_perturbed", "input_query"],
     )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--use-atom-index-embed", action="store_true")
