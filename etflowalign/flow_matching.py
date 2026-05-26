@@ -14,13 +14,19 @@ from .validation import validate_alignment_batch
 @dataclass
 class FlowMatchingConfig:
     sigma: float = 0.05
-    source_type: Literal["gaussian", "reference_anchored", "query_perturbed", "input_query"] = "reference_anchored"
+    source_type: Literal[
+    "gaussian",
+    "reference_anchored",
+    "query_perturbed",
+    "input_query",
+] = "reference_anchored"
     source_noise_scale: float = 0.5
     time_eps: float = 1e-4
     use_kabsch_alignment: bool = True
     harmonic_prior_strength: float = 0.0
     center_source: bool = True
     center_target: bool = True
+    fixed_t: float | None = None
 
 
 class AlignmentFlowMatcher:
@@ -28,8 +34,15 @@ class AlignmentFlowMatcher:
         self.config = config
 
     def sample_time(self, num_graphs: int, device: torch.device) -> Tensor:
-        return torch.empty(num_graphs, device=device).uniform_(self.config.time_eps, 1.0 - self.config.time_eps)
-
+        if self.config.fixed_t is not None:
+            fixed_t = float(self.config.fixed_t)
+            if not 0.0 <= fixed_t <= 1.0:
+                raise ValueError(f"fixed_t must be in [0, 1], got {fixed_t}")
+            return torch.full((num_graphs,), fixed_t, device=device)
+        return torch.empty(num_graphs, device=device).uniform_(
+            self.config.time_eps,
+            1.0 - self.config.time_eps,
+        )
     def sigma_t(self, t_node: Tensor) -> Tensor:
         return self.config.sigma * torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
 
@@ -42,6 +55,9 @@ class AlignmentFlowMatcher:
 
         if stype == "gaussian":
             return torch.randn_like(batch.query_pos)
+        
+        if stype == "input_query":
+            return batch.query_pos.clone()
 
         if stype == "query_perturbed":
             if target_query_pos is None:
