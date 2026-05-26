@@ -120,15 +120,6 @@ def run_training(args: argparse.Namespace) -> None:
             assert target_query_pos is not None
 
         loss = train_step(model, matcher, optimizer, batch, target_query_pos)
-        final_loss = float(loss)
-        if not math.isfinite(final_loss):
-            raise FloatingPointError(f"Non-finite loss at step={step}: {final_loss}")
-
-        if final_loss < best_loss:
-            best_loss = final_loss
-            best_step = step
-            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
         if step % args.log_every == 0 or step == 1:
             print(f"[train] step={step:04d} loss={final_loss:.6f}")
 
@@ -152,27 +143,12 @@ def run_training(args: argparse.Namespace) -> None:
 
     final_ckpt = {
         "model_state": model.state_dict(),
-        "model_args": model_args,
-        "flow_args": flow_args,
-        "train_args": train_args,
-        "final_loss": final_loss,
-        "best_loss": best_loss,
-        "best_step": best_step,
-    }
-    torch.save(final_ckpt, args.save_path)
-
-    if best_model_state is None:
-        raise RuntimeError("best_model_state is missing despite finite training loop.")
-
-    save_path = Path(args.save_path)
-    best_path = str(save_path.with_name(f"{save_path.stem}_best.pt"))
-    best_ckpt = {
-        "model_state": best_model_state,
-        "model_args": model_args,
-        "flow_args": flow_args,
-        "train_args": train_args,
-        "best_loss": best_loss,
-        "best_step": best_step,
+        "model_args": {"hidden_dim": args.hidden_dim, "num_blocks": args.num_blocks},
+        "flow_args": {
+            "sigma": args.sigma,
+            "source_type": args.source_type,
+            "source_noise_scale": args.source_noise_scale,
+        },
     }
     torch.save(best_ckpt, best_path)
 
@@ -196,7 +172,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--source-type",
         type=str,
         default="reference_anchored",
-        choices=["gaussian", "reference_anchored", "query_perturbed", "input_query"],
+        choices=["gaussian", "reference_anchored", "query_perturbed"],
     )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--use-atom-index-embed", action="store_true")
