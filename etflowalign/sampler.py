@@ -29,6 +29,7 @@ class ODESamplerConfig:
         adaptive_dt: Enable simple adaptive step scaling by velocity norm.
         adaptive_dt_max_scale: Maximum multiplier for adaptive dt.
     """
+
     n_steps: int = 50
     t_start: float = 0.0
     t_end: float = 1.0
@@ -53,17 +54,14 @@ class ETFlowAlignSampler:
     """
 
     def __init__(self, model: ETFlowAlignModel, config: ODESamplerConfig) -> None:
-        """Bind trained model and sampling hyperparameters."""
         self.model = model
         self.config = config
 
     def _clip_guidance(self, g: Tensor) -> Tensor:
-        """Clip guidance vectors by L2 norm for numerical stability."""
         norm = torch.norm(g, dim=-1, keepdim=True).clamp_min(1e-8)
         return g * (self.config.max_guidance_norm / norm).clamp(max=1.0)
 
     def _model_v(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor) -> Tensor:
-        """Evaluate model velocity at state x and time t."""
         cur = AlignmentBatch(
             query_pos=x,
             query_atom_type=batch.query_atom_type,
@@ -75,12 +73,15 @@ class ETFlowAlignSampler:
         )
         return self.model(cur, t_graph=t_graph)
 
-    def _apply_guidance(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor, v: Tensor, guidance_fn: Optional[GuidanceFn]) -> Tensor:
-        """Apply optional external guidance based on configured mode.
-
-        Returns:
-            Tuple ``(x, v)`` after guidance adjustment.
-        """
+    def _apply_guidance(
+        self,
+        batch: AlignmentBatch,
+        x: Tensor,
+        t_graph: Tensor,
+        v: Tensor,
+        guidance_fn: Optional[GuidanceFn],
+        dt: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         if guidance_fn is None or self.config.guidance_scale <= 0.0:
             return x, v
 
@@ -98,22 +99,14 @@ class ETFlowAlignSampler:
         if self.config.guidance_mode == "vector_field":
             return x, v + self.config.guidance_scale * g
 
-        # predictor-corrector style: update state separately by guidance.
-        x = x + (self.config.guidance_scale / max(1, self.config.n_steps)) * g
-        return x, v
+        # predictor-corrector: explicit x-state correction scaled by actual dt.
+        if dt is None:
+            raise ValueError("predictor_corrector guidance requires dt.")
+        x_corrected = x + self.config.pc_corrector_step_scale * self.config.guidance_scale * dt * g
+        return x_corrected, v
 
     @torch.no_grad()
     def sample(self, batch: AlignmentBatch, x0: Tensor, guidance_fn: Optional[GuidanceFn] = None) -> Tensor:
-        """Integrate ODE from source state to final aligned state.
-
-        Args:
-            batch: Conditioning batch.
-            x0: Initial query coordinates.
-            guidance_fn: Optional external guidance callback.
-
-        Returns:
-            Final query coordinates after ODE integration.
-        """
         num_graphs = int(batch.query_batch.max().item()) + 1
         t_grid = torch.linspace(self.config.t_start, self.config.t_end, self.config.n_steps + 1, device=x0.device)
 
@@ -124,14 +117,21 @@ class ETFlowAlignSampler:
             t_graph = torch.full((num_graphs,), float(t), device=x.device)
 
             v = self._model_v(batch, x, t_graph)
-            x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn)
+            x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn, dt=dt)
 
             if self.config.solver == "euler":
                 x = x + dt * v
             else:
                 x_pred = x + dt * v
                 t_next = torch.full((num_graphs,), float(t_grid[i + 1]), device=x.device)
+
+                if self.config.guidance_mode == "predictor_corrector" and guidance_fn is not None and self.config.guidance_scale > 0.0:
+                    # (a) predictor_corrector mode: explicitly apply corrected predictor state.
+                    v_pred = self._model_v(batch, x_pred, t_next)
+                    x_pred, _ = self._apply_guidance(batch, x_pred, t_next, v_pred, guidance_fn, dt=dt)
+
                 v_next = self._model_v(batch, x_pred, t_next)
+                _, v_next = self._apply_guidance(batch, x_pred, t_next, v_next, guidance_fn, dt=dt)
                 x = x + 0.5 * dt * (v + v_next)
 
             if not torch.isfinite(x).all():

@@ -1,7 +1,8 @@
 """Training script and utilities for ETFlowAlign.
 
-Usage example:
-    python -m etflowalign.train --steps 200 --batch-size 8 --save-path etflowalign_ckpt.pt
+Examples:
+    python -m etflowalign.train --synthetic-smoke --steps 2 --batch-size 2 --n-atoms 8 --save-path /tmp/etflowalign_smoke.pt
+    python -m etflowalign.train --train-data /path/to/train_batch.pt --steps 1 --save-path /tmp/etflowalign_ckpt.pt
 """
 
 from __future__ import annotations
@@ -10,8 +11,9 @@ import argparse
 from dataclasses import dataclass
 
 import torch
-from torch import optim
+from torch import Tensor, optim
 
+from .data import load_alignment_batch_from_pt
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig, flow_matching_step
 from .model import AlignmentBatch, ETFlowAlignModel
 
@@ -19,12 +21,17 @@ from .model import AlignmentBatch, ETFlowAlignModel
 @dataclass
 class TrainConfig:
     """Optimization hyperparameters for ETFlowAlign training."""
+
     lr: float = 1e-4
     weight_decay: float = 0.0
 
 
-def build_training_components(model: ETFlowAlignModel, train_config: TrainConfig, fm_config: FlowMatchingConfig):
-    """Create matcher + optimizer objects used in training."""
+def build_training_components(
+    model: ETFlowAlignModel,
+    train_config: TrainConfig,
+    fm_config: FlowMatchingConfig,
+) -> tuple[AlignmentFlowMatcher, optim.Optimizer]:
+    """Create flow matcher and optimizer."""
     matcher = AlignmentFlowMatcher(config=fm_config)
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     return matcher, optimizer
@@ -35,7 +42,7 @@ def train_step(
     matcher: AlignmentFlowMatcher,
     optimizer: optim.Optimizer,
     batch: AlignmentBatch,
-    target_query_pos: torch.Tensor,
+    target_query_pos: Tensor,
 ) -> float:
     """Run one optimization step and return scalar loss."""
     model.train()
@@ -47,56 +54,65 @@ def train_step(
     return float(loss.detach().item())
 
 
-def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.device) -> tuple[AlignmentBatch, torch.Tensor]:
-    """Create a toy alignment dataset for smoke-test training.
+def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.device) -> tuple[AlignmentBatch, Tensor]:
+    """Create toy alignment batch for smoke tests."""
+    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)
+    reference_batch = query_batch.clone()
 
-    target_query_pos: reference + smooth deformation + translation.
-    input query_pos in batch is initialized as noisy source state.
-    """
-    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)  # Graph id per query atom.
-    reference_batch = query_batch.clone()  # Graph id per reference atom.
+    reference_pos = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)
+    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)
 
-    # Base molecular-like cloud around origin per graph.
-    ref = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)  # Reference coordinates.
-    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)  # Toy atom ids.
+    translation = 0.25 * torch.randn(batch_size, 3, device=device)
+    target_query_pos = reference_pos + translation[query_batch]
+    target_query_pos = target_query_pos + 0.05 * torch.sin(target_query_pos * 2.0)
 
-    # Construct alignment target from reference with global transform + local deformation.
-    t = torch.randn(batch_size, 3, device=device) * 0.25  # Per-graph translation.
-    target = ref.clone()
-    target = target + t[query_batch]
-    target = target + 0.05 * torch.sin(target * 2.0)
-
-    # Initial query is coarse/un-aligned state.
-    query_init = ref + 0.8 * torch.randn_like(ref)
-
+    query_init = reference_pos + 0.8 * torch.randn_like(reference_pos)
     batch = AlignmentBatch(
         query_pos=query_init,
         query_atom_type=atom_type,
         query_batch=query_batch,
-        reference_pos=ref,
+        reference_pos=reference_pos,
         reference_atom_type=atom_type,
         reference_batch=reference_batch,
-        pocket_pos=None,
     )
-    return batch, target
+    return batch, target_query_pos
 
 
 def run_training(args: argparse.Namespace) -> None:
-    """Entry point used by CLI: train on synthetic data and save checkpoint."""
+    """CLI training entrypoint."""
     device = torch.device(args.device)
-    model = ETFlowAlignModel(hidden_dim=args.hidden_dim, num_blocks=args.num_blocks).to(device)
+    model = ETFlowAlignModel(
+        hidden_dim=args.hidden_dim,
+        num_blocks=args.num_blocks,
+        use_atom_index_embed=args.use_atom_index_embed,
+        use_direct_vector_head=args.use_direct_vector_head,
+        max_atoms=args.max_atoms,
+    ).to(device)
 
     fm_config = FlowMatchingConfig(
         sigma=args.sigma,
         source_type=args.source_type,
         source_noise_scale=args.source_noise_scale,
+        center_source=args.center_source,
+        center_target=args.center_target,
+        use_kabsch_alignment=args.use_kabsch_alignment,
+        fixed_t=args.fixed_t,
     )
     train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
     matcher, optimizer = build_training_components(model, train_config, fm_config)
 
     for step in range(1, args.steps + 1):
-        batch, target = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
-        loss = train_step(model, matcher, optimizer, batch, target)
+        if args.synthetic_smoke:
+            batch, target_query_pos = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
+        else:
+            batch, target_query_pos, _ = load_alignment_batch_from_pt(
+                args.train_data,
+                require_target=True,
+                device=device,
+            )
+            assert target_query_pos is not None
+
+        loss = train_step(model, matcher, optimizer, batch, target_query_pos)
         if step % args.log_every == 0 or step == 1:
             print(f"[train] step={step:04d} loss={loss:.6f}")
 
@@ -105,11 +121,18 @@ def run_training(args: argparse.Namespace) -> None:
         "model_args": {
             "hidden_dim": args.hidden_dim,
             "num_blocks": args.num_blocks,
+            "use_atom_index_embed": args.use_atom_index_embed,
+            "use_direct_vector_head": args.use_direct_vector_head,
+            "max_atoms": args.max_atoms,
         },
         "flow_args": {
             "sigma": args.sigma,
             "source_type": args.source_type,
             "source_noise_scale": args.source_noise_scale,
+            "center_source": args.center_source,
+            "center_target": args.center_target,
+            "use_kabsch_alignment": args.use_kabsch_alignment,
+            "fixed_t": args.fixed_t,
         },
     }
     torch.save(ckpt, args.save_path)
@@ -117,8 +140,8 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Define CLI arguments for the standalone training script."""
-    p = argparse.ArgumentParser(description="Train ETFlowAlign on synthetic alignment data.")
+    """Define training CLI."""
+    p = argparse.ArgumentParser(description="Train ETFlowAlign.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
@@ -128,16 +151,41 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--sigma", type=float, default=0.05)
-    p.add_argument("--source-type", type=str, default="reference_anchored", choices=["gaussian", "reference_anchored", "query_perturbed"])
+    p.add_argument(
+        "--source-type",
+        type=str,
+        default="reference_anchored",
+        choices=["gaussian", "reference_anchored", "query_perturbed", "input_query"],
+    )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
+    p.add_argument("--use-atom-index-embed", action="store_true")
+    p.add_argument("--use-direct-vector-head", action="store_true")
+    p.add_argument("--max-atoms", type=int, default=256)
+
+    p.add_argument("--center-source", dest="center_source", action="store_true")
+    p.add_argument("--no-center-source", dest="center_source", action="store_false")
+    p.set_defaults(center_source=True)
+    p.add_argument("--center-target", dest="center_target", action="store_true")
+    p.add_argument("--no-center-target", dest="center_target", action="store_false")
+    p.set_defaults(center_target=True)
+    p.add_argument("--use-kabsch-alignment", dest="use_kabsch_alignment", action="store_true")
+    p.add_argument("--no-use-kabsch-alignment", dest="use_kabsch_alignment", action="store_false")
+    p.set_defaults(use_kabsch_alignment=True)
+    p.add_argument("--fixed-t", type=float, default=None)
+
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-path", type=str, default="etflowalign_ckpt.pt")
+
+    p.add_argument("--synthetic-smoke", action="store_true")
+    p.add_argument("--train-data", type=str, default="")
     return p
 
 
 def main() -> None:
     """CLI main."""
     args = build_argparser().parse_args()
+    if args.synthetic_smoke == bool(args.train_data):
+        raise ValueError("Provide exactly one of --synthetic-smoke or --train-data.")
     run_training(args)
 
 

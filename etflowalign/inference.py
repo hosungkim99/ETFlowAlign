@@ -1,30 +1,21 @@
-"""Inference script and APIs for ETFlowAlign.
-
-Usage example:
-    python -m etflowalign.inference --checkpoint etflowalign_ckpt.pt --num-samples 16
-"""
+"""Inference script and APIs for ETFlowAlign."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch import Tensor
 
+from .data import load_alignment_batch_from_pt
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
 from .model import AlignmentBatch, ETFlowAlignModel
 from .sampler import ETFlowAlignSampler, GuidanceFn, ODESamplerConfig
 from .train import make_synthetic_alignment_batch
+from .validation import validate_alignment_batch
 
 RankFn = Callable[[Tensor, AlignmentBatch], Tensor]
-
-
-@dataclass
-class InferenceConfig:
-    """Minimal inference configuration container."""
-    num_samples: int = 8
 
 
 def generate_candidates(
@@ -34,80 +25,49 @@ def generate_candidates(
     guidance_fn: Optional[GuidanceFn] = None,
     num_samples: int = 8,
 ) -> Tensor:
-    """Generate aligned query candidates as ``[num_samples, N, 3]``.
-
-    Args:
-        sampler: ODE sampler.
-        batch: Conditioning batch.
-        source_sampler: Callback generating initial coordinates ``x0``.
-        guidance_fn: Optional guidance callback.
-        num_samples: Number of candidates to generate.
-    """
-    outputs = []
+    """Generate aligned candidates with strict interface checks."""
+    validate_alignment_batch(batch)
+    outputs: list[Tensor] = []
     for _ in range(num_samples):
         x0 = source_sampler(batch)
-        xT = sampler.sample(batch=batch, x0=x0, guidance_fn=guidance_fn)
-        outputs.append(xT)
+        if x0.shape != batch.query_pos.shape:
+            raise ValueError(
+                "source_sampler must return query_pos-matched shape "
+                f"{tuple(batch.query_pos.shape)}, got {tuple(x0.shape)}."
+            )
+        outputs.append(sampler.sample(batch=batch, x0=x0, guidance_fn=guidance_fn))
     return torch.stack(outputs, dim=0)
 
 
-def reference_fit_ranker(candidates: Tensor, batch: AlignmentBatch) -> Tensor:
-    """Simple ranking adapter: negative MSE to reference positions per candidate.
+def rank_candidates(
+    candidates: Tensor,
+    batch: AlignmentBatch,
+    rank_fn: Optional[RankFn] = None,
+) -> tuple[Tensor, Tensor]:
+    """Rank candidates with v0.1 one-complex-per-call validation."""
+    num_graphs = int(batch.query_batch.max().item()) + 1 if batch.query_batch.numel() else 0
+    if num_graphs != 1:
+        raise ValueError("v0.1 ranking supports exactly one complex per inference call.")
 
-    In real usage this should be replaced with docking/ranking metrics such as
-    TanimotoCombo + pocket-aware scores.
-    """
-    if batch.reference_pos is None:
-        return torch.zeros(candidates.size(0), device=candidates.device)
+    scores = rank_fn(candidates, batch) if rank_fn is not None else torch.zeros(candidates.size(0), device=candidates.device)
+    if scores.dim() != 1 or scores.size(0) != candidates.size(0):
+        raise ValueError("rank_fn must return Tensor[num_samples].")
 
-    diff = candidates - batch.reference_pos.unsqueeze(0)
-    mse = (diff * diff).mean(dim=(1, 2))
-    return -mse
-
-
-def rank_candidates(candidates: Tensor, batch: AlignmentBatch, rank_fn: Optional[RankFn] = None) -> tuple[Tensor, Tensor]:
-    """Rank candidates in descending score order."""
-    if rank_fn is None:
-        scores = reference_fit_ranker(candidates, batch)
-    else:
-        scores = rank_fn(candidates, batch)
     order = torch.argsort(scores, descending=True)
     return candidates[order], scores[order]
 
 
-def make_pocket_pull_guidance(scale: float = 1.0) -> GuidanceFn:
-    """Create a toy pocket guidance: pull query toward pocket center if available."""
-
-    def _guidance(batch: AlignmentBatch, t_graph: Tensor, v: Tensor) -> Tensor:
-        """Guidance callback used by sampler.
-
-        Variables:
-            batch: Current sampler batch/state.
-            t_graph: Current time per graph.
-            v: Current model velocity prediction.
-        """
-        if batch.pocket_pos is None or batch.pocket_pos.numel() == 0:
-            return torch.zeros_like(v)
-        pocket_center = batch.pocket_pos.mean(dim=0, keepdim=True)
-        g = pocket_center - batch.query_pos
-        return scale * g
-
-    return _guidance
-
-
 def run_inference(args: argparse.Namespace) -> None:
-    """CLI inference routine: load checkpoint, sample, rank, and optionally save."""
+    """CLI inference entrypoint."""
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
 
-    model_args = ckpt.get("model_args", {})  # Model architecture params saved during training.
-    flow_args = ckpt.get("flow_args", {})  # Flow matcher params for source sampling consistency.
-
-    model = ETFlowAlignModel(**model_args).to(device)
+    model = ETFlowAlignModel(**ckpt.get("model_args", {})).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    fm = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
+    flow_args = ckpt.get("flow_args", {})
+    flow_matcher = AlignmentFlowMatcher(FlowMatchingConfig(**flow_args))
     sampler = ETFlowAlignSampler(
         model=model,
         config=ODESamplerConfig(
@@ -119,34 +79,44 @@ def run_inference(args: argparse.Namespace) -> None:
         ),
     )
 
-    # Demo input (replace with real preprocessed task data).
-    batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
-    if args.use_pocket_guidance:
-        batch.pocket_pos = batch.reference_pos + 0.1 * torch.randn_like(batch.reference_pos)
-
-    source_sampler = lambda b: fm.sample_source(b)  # noqa: E731
-    guidance_fn = make_pocket_pull_guidance(scale=1.0) if args.use_pocket_guidance else None
+    input_metadata: dict[str, Any] = {}
+    if args.synthetic_smoke:
+        batch, _ = make_synthetic_alignment_batch(batch_size=1, n_atoms=args.n_atoms, device=device)
+    else:
+        batch, _, input_metadata = load_alignment_batch_from_pt(args.input_batch, require_target=False, device=device)
 
     candidates = generate_candidates(
         sampler=sampler,
         batch=batch,
-        source_sampler=source_sampler,
-        guidance_fn=guidance_fn,
+        source_sampler=lambda b: flow_matcher.sample_source(b),
+        guidance_fn=None,
         num_samples=args.num_samples,
     )
-    ranked, scores = rank_candidates(candidates=candidates, batch=batch)
+    ranked, scores = rank_candidates(candidates, batch)
 
-    print(f"[inference] candidates={candidates.shape}")
+    print(f"[inference] candidates={ranked.shape}")
     print(f"[inference] top_score={scores[0].item():.6f}")
 
     if args.save_path:
-        torch.save({"candidates": ranked.cpu(), "scores": scores.cpu()}, args.save_path)
+        run_metadata = {
+            "checkpoint": args.checkpoint,
+            "input_batch": args.input_batch,
+            "synthetic_smoke": bool(args.synthetic_smoke),
+            "num_samples": int(args.num_samples),
+            "n_steps": int(args.n_steps),
+            "solver": args.solver,
+            "guidance_scale": float(args.guidance_scale),
+            "guidance_mode": args.guidance_mode,
+            "source_type": flow_args.get("source_type"),
+            "input_metadata": input_metadata,
+        }
+        torch.save({"candidates": ranked.cpu(), "scores": scores.cpu(), "metadata": run_metadata}, args.save_path)
         print(f"[inference] saved to: {args.save_path}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Define CLI arguments for inference script."""
-    p = argparse.ArgumentParser(description="Run ETFlowAlign inference on synthetic demo data.")
+    """Define inference CLI."""
+    p = argparse.ArgumentParser(description="Run ETFlowAlign inference.")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--num-samples", type=int, default=8)
@@ -156,14 +126,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--guidance-scale", type=float, default=0.0)
     p.add_argument("--guidance-mode", type=str, default="vector_field", choices=["vector_field", "predictor_corrector"])
     p.add_argument("--max-guidance-norm", type=float, default=5.0)
-    p.add_argument("--use-pocket-guidance", action="store_true")
+
+    p.add_argument("--synthetic-smoke", action="store_true")
+    p.add_argument("--input-batch", type=str, default="")
     p.add_argument("--save-path", type=str, default="")
     return p
 
 
 def main() -> None:
-    """CLI main."""
     args = build_argparser().parse_args()
+    if args.synthetic_smoke == bool(args.input_batch):
+        raise ValueError("Provide exactly one of --synthetic-smoke or --input-batch.")
     run_inference(args)
 
 
