@@ -49,11 +49,31 @@ def train_step(
     """Run one optimization step and return scalar loss."""
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    loss = flow_matching_step(model=model, matcher=matcher, batch=batch, target_query_pos=target_query_pos)
+
+    loss = flow_matching_step(
+        model=model,
+        matcher=matcher,
+        batch=batch,
+        target_query_pos=target_query_pos,
+    )
+
+    if not torch.isfinite(loss).all():
+        raise FloatingPointError(
+            f"Non-finite training loss before backward: "
+            f"{loss.detach().cpu().item()}"
+        )
+
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
     optimizer.step()
-    return float(loss.detach().item())
+
+    loss_value = float(loss.detach().cpu().item())
+    if not math.isfinite(loss_value):
+        raise FloatingPointError(
+            f"Non-finite training loss after optimization step: {loss_value}"
+        )
+
+    return loss_value
 
 
 def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.device) -> tuple[AlignmentBatch, Tensor]:
@@ -80,48 +100,25 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
     return batch, target_query_pos
 
 
+def _clone_state_dict_to_cpu(model: ETFlowAlignModel) -> dict[str, torch.Tensor]:
+    """Clone model parameters to CPU for checkpointing."""
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _make_best_checkpoint_path(save_path: str) -> Path:
+    """Create best-checkpoint path from final checkpoint path."""
+    path = Path(save_path)
+    if path.suffix == ".pt":
+        return path.with_name(f"{path.stem}_best{path.suffix}")
+    return Path(f"{save_path}.best.pt")
+
+
 def run_training(args: argparse.Namespace) -> None:
     """CLI training entrypoint."""
     device = torch.device(args.device)
-    model = ETFlowAlignModel(
-        hidden_dim=args.hidden_dim,
-        num_blocks=args.num_blocks,
-        use_atom_index_embed=args.use_atom_index_embed,
-        use_direct_vector_head=args.use_direct_vector_head,
-        max_atoms=args.max_atoms,
-    ).to(device)
-
-    fm_config = FlowMatchingConfig(
-        sigma=args.sigma,
-        source_type=args.source_type,
-        source_noise_scale=args.source_noise_scale,
-        center_source=args.center_source,
-        center_target=args.center_target,
-        use_kabsch_alignment=args.use_kabsch_alignment,
-        fixed_t=args.fixed_t,
-    )
-    train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
-    matcher, optimizer = build_training_components(model, train_config, fm_config)
-
-    best_loss = float("inf")
-    best_step = -1
-    best_model_state: dict[str, torch.Tensor] | None = None
-    final_loss = float("nan")
-
-    for step in range(1, args.steps + 1):
-        if args.synthetic_smoke:
-            batch, target_query_pos = make_synthetic_alignment_batch(args.batch_size, args.n_atoms, device)
-        else:
-            batch, target_query_pos, _ = load_alignment_batch_from_pt(
-                args.train_data,
-                require_target=True,
-                device=device,
-            )
-            assert target_query_pos is not None
-
-        loss = train_step(model, matcher, optimizer, batch, target_query_pos)
-        if step % args.log_every == 0 or step == 1:
-            print(f"[train] step={step:04d} loss={final_loss:.6f}")
 
     model_args = {
         "hidden_dim": args.hidden_dim,
@@ -130,6 +127,9 @@ def run_training(args: argparse.Namespace) -> None:
         "use_direct_vector_head": args.use_direct_vector_head,
         "max_atoms": args.max_atoms,
     }
+
+    model = ETFlowAlignModel(**model_args).to(device)
+
     flow_args = {
         "sigma": args.sigma,
         "source_type": args.source_type,
@@ -139,22 +139,94 @@ def run_training(args: argparse.Namespace) -> None:
         "use_kabsch_alignment": args.use_kabsch_alignment,
         "fixed_t": args.fixed_t,
     }
+
+    fm_config = FlowMatchingConfig(**flow_args)
+
+    train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay)
+    matcher, optimizer = build_training_components(model, train_config, fm_config)
+
     train_args = vars(args).copy()
 
+    best_loss = float("inf")
+    best_step: int | None = None
+    best_model_state: dict[str, torch.Tensor] | None = None
+    final_loss: float | None = None
+
+    for step in range(1, args.steps + 1):
+        if args.synthetic_smoke:
+            batch, target_query_pos = make_synthetic_alignment_batch(
+                args.batch_size,
+                args.n_atoms,
+                device,
+            )
+        else:
+            batch, target_query_pos, _ = load_alignment_batch_from_pt(
+                args.train_data,
+                require_target=True,
+                device=device,
+            )
+            assert target_query_pos is not None
+
+        loss = train_step(model, matcher, optimizer, batch, target_query_pos)
+        final_loss = float(loss)
+
+        if not math.isfinite(final_loss):
+            raise FloatingPointError(
+                f"Non-finite loss at step={step}: {final_loss}. "
+                "Checkpoint will not be saved."
+            )
+
+        if final_loss < best_loss:
+            best_loss = final_loss
+            best_step = step
+            best_model_state = _clone_state_dict_to_cpu(model)
+
+        if step % args.log_every == 0 or step == 1:
+            best_info = f" best={best_loss:.6f}@{best_step}" if best_step is not None else ""
+            print(f"[train] step={step:04d} loss={final_loss:.6f}{best_info}")
+
+    if final_loss is None:
+        raise RuntimeError("Training finished without running any optimization step.")
+
+    if best_model_state is None or best_step is None:
+        raise RuntimeError(
+            "No finite best checkpoint was captured. "
+            "Training likely failed before producing a valid loss."
+        )
+
     final_ckpt = {
-        "model_state": model.state_dict(),
-        "model_args": {"hidden_dim": args.hidden_dim, "num_blocks": args.num_blocks},
-        "flow_args": {
-            "sigma": args.sigma,
-            "source_type": args.source_type,
-            "source_noise_scale": args.source_noise_scale,
-        },
+        "model_state": _clone_state_dict_to_cpu(model),
+        "model_args": model_args,
+        "flow_args": flow_args,
+        "train_args": train_args,
+        "final_loss": final_loss,
+        "best_loss": best_loss,
+        "best_step": best_step,
     }
+
+    best_ckpt = {
+        "model_state": best_model_state,
+        "model_args": model_args,
+        "flow_args": flow_args,
+        "train_args": train_args,
+        "best_loss": best_loss,
+        "best_step": best_step,
+    }
+
+    save_path = Path(args.save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_path = _make_best_checkpoint_path(args.save_path)
+    best_path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(final_ckpt, save_path)
     torch.save(best_ckpt, best_path)
 
-    print(f"[train] checkpoint saved to: {args.save_path}")
-    print(f"[train] best checkpoint saved to: {best_path} at step={best_step} loss={best_loss:.6f}")
-
+    print(f"[train] checkpoint saved to: {save_path}")
+    print(
+        f"[train] best checkpoint saved to: {best_path} "
+        f"at step={best_step} loss={best_loss:.6f}"
+    )
 
 def build_argparser() -> argparse.ArgumentParser:
     """Define training CLI."""
