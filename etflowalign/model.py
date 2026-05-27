@@ -103,7 +103,9 @@ def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors:
         p = pos[node_idx]  # Local coordinates for graph g: [Ng, 3]
         diff = p[:, None, :] - p[None, :, :]
         dist_sq = (diff * diff).sum(-1)
-        mask = (dist_sq <= cutoff_sq) & (~torch.eye(node_idx.numel(), device=pos.device, dtype=torch.bool))
+        mask = (dist_sq <= cutoff_sq) & (
+            ~torch.eye(node_idx.numel(), device=pos.device, dtype=torch.bool)
+        )
 
         for i in range(node_idx.numel()):
             nbr_local = torch.where(mask[i])[0]
@@ -246,6 +248,7 @@ class ETFlowAlignModel(nn.Module):
         max_neighbors: int = 32,
         use_atom_index_embed: bool = False,
         use_direct_vector_head: bool = False,
+        use_equivariant_basis_head: bool = False,
         max_atoms: int = 256,
     ) -> None:
         super().__init__()
@@ -255,16 +258,45 @@ class ETFlowAlignModel(nn.Module):
         self.atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
         self.use_atom_index_embed = bool(use_atom_index_embed)
         self.use_direct_vector_head = bool(use_direct_vector_head)
+        self.use_equivariant_basis_head = bool(use_equivariant_basis_head)
         self.max_atoms = int(max_atoms)
+
         if self.use_atom_index_embed:
             self.atom_index_embed = nn.Embedding(self.max_atoms, hidden_dim)
+
         self.time_embed = SimpleTimeEmbedding(time_embed_dim)
         self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4, hidden_dim)
 
         self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
-        self.out_gate = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+
+        # Legacy production head:
+        #   v_i = alpha_i x_i
+        # This is E(3)-equivariant but too restrictive for many alignment flows.
+        self.out_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Debug head:
+        #   v_i = MLP(h_i)
+        # This is expressive and useful for overfit sanity checks, but not E(3)-equivariant.
         if self.use_direct_vector_head:
-            self.out_vec = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 3))
+            self.out_vec = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 3),
+            )
+
+        # Production-compatible expressive head:
+        #   v_i = sum_k a_{ik} b_{ik}
+        # where b_{ik} are equivariant vector bases and a_{ik} are invariant scalars.
+        if self.use_equivariant_basis_head:
+            self.out_basis_coeff = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 4),
+            )
 
     def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor]:
         """Return direction and distance from query atoms to reference center."""
@@ -272,12 +304,100 @@ class ETFlowAlignModel(nn.Module):
             zero = torch.zeros_like(batch.query_pos)
             return zero, torch.zeros(batch.query_pos.size(0), 1, device=batch.query_pos.device, dtype=batch.query_pos.dtype)
 
-        num_ref_graphs = int(batch.reference_batch.max().item()) + 1
-        ref_center = _segment_mean(batch.reference_pos, batch.reference_batch, num_ref_graphs)
+        num_graphs = int(batch.query_batch.max().item()) + 1
+        ref_center = _segment_mean(batch.reference_pos, batch.reference_batch, num_graphs)
         delta = ref_center[batch.query_batch] - batch.query_pos
         dist = torch.norm(delta, dim=-1, keepdim=True)
         direction = delta / dist.clamp_min(1e-8)
         return direction, dist
+
+    def _reference_delta_basis(self, batch: AlignmentBatch) -> Tensor:
+        """Return reference-center-to-query vector basis.
+
+        Basis:
+            b_ref,i = c_ref[graph(i)] - q_i
+
+        This vector is translation-invariant and rotation-equivariant.
+        """
+        if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
+            return torch.zeros_like(batch.query_pos)
+
+        num_graphs = int(batch.query_batch.max().item()) + 1
+        ref_center = _segment_mean(batch.reference_pos, batch.reference_batch, num_graphs)
+        return ref_center[batch.query_batch] - batch.query_pos
+
+    def _pocket_delta_basis(self, batch: AlignmentBatch) -> Tensor:
+        """Return pocket-center-to-query vector basis.
+
+        Basis:
+            b_pocket,i = c_pocket[graph(i)] - q_i
+
+        If pocket coordinates are missing, return zero vectors.
+        """
+        if batch.pocket_pos is None or batch.pocket_batch is None or batch.pocket_batch.numel() == 0:
+            return torch.zeros_like(batch.query_pos)
+
+        num_graphs = int(batch.query_batch.max().item()) + 1
+        pocket_center = _segment_mean(batch.pocket_pos, batch.pocket_batch, num_graphs)
+        return pocket_center[batch.query_batch] - batch.query_pos
+
+    def _neighbor_vector_basis(self, x: Tensor, edge_index: Tensor) -> Tensor:
+        """Return query-query neighbor aggregate vector basis.
+
+        Basis:
+            b_nbr,i = sum_{j in N(i)} (x_j - x_i)
+
+        This vector is translation-invariant and rotation-equivariant.
+        """
+        if edge_index.numel() == 0:
+            return torch.zeros_like(x)
+
+        i, j = edge_index[0], edge_index[1]
+        rij = x[j] - x[i]
+        out = torch.zeros_like(x)
+        out.index_add_(0, i, rij)
+        return out
+
+    def _local_atom_index(self, query_batch: Tensor) -> Tensor:
+        """Return graph-local atom indices for optional debug atom-index embeddings."""
+        local_index = torch.zeros_like(query_batch)
+        for g in query_batch.unique(sorted=True):
+            mask = query_batch == g
+            n = int(mask.sum().item())
+            local_index[mask] = torch.arange(n, device=query_batch.device, dtype=query_batch.dtype)
+        return local_index
+
+    def _equivariant_basis_head(self, h: Tensor, x: Tensor, batch: AlignmentBatch, edge_index: Tensor) -> Tensor:
+        """Predict velocity by combining equivariant vector bases.
+
+        The scalar coefficients are invariant because they are predicted from scalar node
+        features. The bases rotate with the input coordinates. Their weighted sum is
+        therefore E(3)-equivariant.
+
+        Bases:
+            0. x: query-centered coordinate basis after equivariant blocks.
+            1. reference delta: reference center - query atom.
+            2. pocket delta: pocket center - query atom.
+            3. neighbor aggregate: sum_j (x_j - x_i).
+        """
+        coeff = self.out_basis_coeff(h)  # [N, 4]
+
+        basis_query = x
+        basis_reference = self._reference_delta_basis(batch)
+        basis_pocket = self._pocket_delta_basis(batch)
+        basis_neighbor = self._neighbor_vector_basis(x, edge_index)
+
+        bases = torch.stack(
+            [
+                basis_query,
+                basis_reference,
+                basis_pocket,
+                basis_neighbor,
+            ],
+            dim=1,
+        )  # [N, 4, 3]
+
+        return (coeff.unsqueeze(-1) * bases).sum(dim=1)
 
     def forward(self, batch: AlignmentBatch, t_graph: Tensor) -> Tensor:
         """Predict query velocity field ``v_theta(x_t, t, cond)``.
@@ -293,30 +413,37 @@ class ETFlowAlignModel(nn.Module):
             return torch.zeros_like(batch.query_pos)
 
         num_graphs = int(batch.query_batch.max().item()) + 1
-        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)  # Per-graph center of mass.
-        x = batch.query_pos - com[batch.query_batch]  # Translation-invariant coordinates.
+        com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)
+        x = batch.query_pos - com[batch.query_batch]
 
-        h_atom = self.atom_embed(batch.query_atom_type)  # Atom identity features.
+        h_atom = self.atom_embed(batch.query_atom_type)
+
         if self.use_atom_index_embed:
-            local_index = torch.zeros_like(batch.query_batch)
-            for g in batch.query_batch.unique(sorted=True):
-                mask = batch.query_batch == g
-                n = int(mask.sum().item())
-                local_index[mask] = torch.arange(n, device=batch.query_batch.device, dtype=batch.query_batch.dtype)
+            local_index = self._local_atom_index(batch.query_batch)
             if int(local_index.max().item()) >= self.max_atoms:
                 raise ValueError(f"local atom index exceeds max_atoms={self.max_atoms}; increase --max-atoms.")
             h_atom = h_atom + self.atom_index_embed(local_index)
-        h_t = self.time_embed(t_graph)[batch.query_batch]  # Time features expanded to nodes.
-        ref_dir, ref_dist = self._reference_context(batch)  # Conditioning from reference geometry.
-        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))  # Initial node states.
+
+        h_t = self.time_embed(t_graph)[batch.query_batch]
+        ref_dir, ref_dist = self._reference_context(batch)
+
+        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))
 
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
+
         for block in self.blocks:
             h, x = block(h, x, edge_index)
 
+        # Highest priority: debug direct head.
+        # This is intentionally non-equivariant and should be used for sanity checks only.
         if self.use_direct_vector_head:
             return self.out_vec(h)
 
-        gate = self.out_gate(h)  # Scalar gate per atom.
-        v = gate * x  # Vector field aligned with equivariant coordinate features.
+        # Production-compatible expressive equivariant head.
+        if self.use_equivariant_basis_head:
+            return self._equivariant_basis_head(h, x, batch, edge_index)
+
+        # Legacy restrictive equivariant head.
+        gate = self.out_gate(h)
+        v = gate * x
         return v
