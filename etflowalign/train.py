@@ -87,6 +87,7 @@ def run_training(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         num_blocks=args.num_blocks,
         use_atom_index_embed=args.use_atom_index_embed,
+        use_equivariant_basis_head=args.use_equivariant_basis_head,
         use_direct_vector_head=args.use_direct_vector_head,
         max_atoms=args.max_atoms,
         use_node_attr=args.use_node_attr,
@@ -138,6 +139,7 @@ def run_training(args: argparse.Namespace) -> None:
         "hidden_dim": args.hidden_dim,
         "num_blocks": args.num_blocks,
         "use_atom_index_embed": args.use_atom_index_embed,
+        "use_equivariant_basis_head": args.use_equivariant_basis_head,
         "use_direct_vector_head": args.use_direct_vector_head,
         "max_atoms": args.max_atoms,
         "use_node_attr": args.use_node_attr,
@@ -204,6 +206,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--use-atom-index-embed", action="store_true")
+    p.add_argument("--use-equivariant-basis-head", dest="use_equivariant_basis_head", action="store_true")
+    p.add_argument("--no-use-equivariant-basis-head", dest="use_equivariant_basis_head", action="store_false")
+    p.set_defaults(use_equivariant_basis_head=True)
     p.add_argument("--use-direct-vector-head", action="store_true")
     p.add_argument("--max-atoms", type=int, default=256)
     p.add_argument("--use-node-attr", action="store_true")

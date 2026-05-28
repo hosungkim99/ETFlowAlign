@@ -245,6 +245,7 @@ class ETFlowAlignModel(nn.Module):
         edge_cutoff: float = 6.0,
         max_neighbors: int = 32,
         use_atom_index_embed: bool = False,
+        use_equivariant_basis_head: bool = True,
         use_direct_vector_head: bool = False,
         max_atoms: int = 256,
         use_node_attr: bool = False,
@@ -256,6 +257,7 @@ class ETFlowAlignModel(nn.Module):
 
         self.atom_embed = nn.Embedding(atom_vocab_size, hidden_dim)
         self.use_atom_index_embed = bool(use_atom_index_embed)
+        self.use_equivariant_basis_head = bool(use_equivariant_basis_head)
         self.use_direct_vector_head = bool(use_direct_vector_head)
         self.max_atoms = int(max_atoms)
         self.use_node_attr = bool(use_node_attr)
@@ -329,7 +331,9 @@ class ETFlowAlignModel(nn.Module):
 
         if self.use_direct_vector_head:
             return self.out_vec(h)
+        if self.use_equivariant_basis_head:
+            return self._equivariant_basis_head(h=h, x=x)
 
-        gate = self.out_gate(h)  # Scalar gate per atom.
-        v = gate * x  # Vector field aligned with equivariant coordinate features.
+        gate = self.out_gate(h)  # Legacy scalar gate per atom.
+        v = gate * x
         return v
