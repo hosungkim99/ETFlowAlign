@@ -1,23 +1,22 @@
-"""Prepare a DiffAlign-style inference .pt batch with node attributes."""
+"""Prepare DiffAlign example inference batch (.pt) for ETFlowAlign smoke tests."""
 from __future__ import annotations
-import argparse, torch
-from rdkit import Chem
-from etflowalign.diffalign_adapter import make_inference_payload
 
-def _load_first_mol(path:str):
-    if path.endswith('.sdf'):
-        mols=[m for m in Chem.SDMolSupplier(path, removeHs=False) if m is not None]
-        if not mols: raise ValueError(f'No molecule in {path}')
-        return mols[0]
-    raise ValueError('Only .sdf supported')
+import argparse
+import torch
 
-def main():
-    p=argparse.ArgumentParser()
-    p.add_argument('--query-sdf', required=True)
-    p.add_argument('--reference-sdf', required=True)
-    p.add_argument('--output-pt', required=True)
-    a=p.parse_args()
-    q=_load_first_mol(a.query_sdf); r=_load_first_mol(a.reference_sdf)
-    torch.save(make_inference_payload(q,r), a.output_pt)
-    print(f'[prepare] saved: {a.output_pt}')
-if __name__=='__main__': main()
+from etflowalign.diffalign_adapter import build_diffalign_example_inference_payload
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--repo-root", required=True)
+    p.add_argument("--out", required=True)
+    args = p.parse_args()
+
+    payload = build_diffalign_example_inference_payload(args.repo_root)
+    torch.save(payload, args.out)
+    print(f"[prepare] saved: {args.out}")
+
+
+if __name__ == "__main__":
+    main()

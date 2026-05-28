@@ -1,28 +1,43 @@
-"""Prepare a DiffAlign-style training .pt batch with target_query_pos + node attrs."""
+"""Prepare DiffAlign example train batch (.pt) for ETFlowAlign smoke tests."""
 from __future__ import annotations
-import argparse, torch
-from rdkit import Chem
-from etflowalign.diffalign_adapter import make_train_payload
 
-def _load_first_mol(path:str):
-    mols=[m for m in Chem.SDMolSupplier(path, removeHs=False) if m is not None]
-    if not mols: raise ValueError(f'No molecule in {path}')
-    return mols[0]
+import argparse
+from pathlib import Path
 
-def _pos(m):
-    c=m.GetConformer(); out=[]
-    for i in range(m.GetNumAtoms()):
-        p=c.GetAtomPosition(i); out.append([p.x,p.y,p.z])
+import torch
+
+from etflowalign.diffalign_adapter import diffalign_batches_to_etflowalign_payload, load_rdkit_mol
+
+
+def _pos(mol):
+    conf = mol.GetConformer()
+    out = []
+    for i in range(mol.GetNumAtoms()):
+        p = conf.GetAtomPosition(i)
+        out.append([float(p.x), float(p.y), float(p.z)])
     return torch.tensor(out, dtype=torch.float32)
 
-def main():
-    p=argparse.ArgumentParser()
-    p.add_argument('--query-sdf', required=True)
-    p.add_argument('--reference-sdf', required=True)
-    p.add_argument('--target-query-sdf', required=True)
-    p.add_argument('--output-pt', required=True)
-    a=p.parse_args()
-    q=_load_first_mol(a.query_sdf); r=_load_first_mol(a.reference_sdf); t=_load_first_mol(a.target_query_sdf)
-    torch.save(make_train_payload(q,r,_pos(t)), a.output_pt)
-    print(f'[prepare] saved: {a.output_pt}')
-if __name__=='__main__': main()
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--repo-root", required=True)
+    p.add_argument("--out", required=True)
+    args = p.parse_args()
+
+    ex = Path(args.repo_root) / "external" / "diffalign" / "diffalign" / "example"
+    query = load_rdkit_mol(str(ex / "query.sdf"))
+    reference = load_rdkit_mol(str(ex / "reference.sdf"))
+
+    # For example train payload, use reference geometry as alignment target proxy.
+    target_query_pos = _pos(reference)
+    payload = diffalign_batches_to_etflowalign_payload(
+        query_mol=query,
+        reference_mol=reference,
+        target_query_pos=target_query_pos,
+    )
+    torch.save(payload, args.out)
+    print(f"[prepare] saved: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
