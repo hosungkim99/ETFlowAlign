@@ -136,6 +136,34 @@ def mol_to_graph_data_obj_local(mol: Chem.Mol) -> Data:
         node_attr=node_attr,
     )
     
+def mol_to_bond_index_and_length_local(mol: Chem.Mol, pos: Tensor) -> tuple[Tensor, Tensor]:
+    """Build undirected query bond index and target bond lengths.
+
+    Returns:
+        bond_index: LongTensor[2, E], one undirected edge per RDKit bond.
+        bond_length: FloatTensor[E], conformer bond length for each bond.
+    """
+    edges = []
+    lengths = []
+
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+
+        edges.append((i, j))
+        lengths.append(torch.linalg.norm(pos[i] - pos[j]))
+
+    if not edges:
+        return (
+            torch.empty((2, 0), dtype=torch.long),
+            torch.empty((0,), dtype=pos.dtype),
+        )
+
+    bond_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    bond_length = torch.stack(lengths).to(dtype=pos.dtype)
+
+    return bond_index, bond_length    
+    
 def _make_cpu_generator(seed: int | None) -> torch.Generator | None:
     if seed is None:
         return None
@@ -382,7 +410,10 @@ def build_diffalign_example_train_payload(
 
     # Important: target must be query-shaped [N_query, 3], not reference-shaped.
     target_query_pos = query_data.pos.clone() - reference_mean
-
+    query_bond_index, query_bond_length = mol_to_bond_index_and_length_local(
+    query_mol,
+    target_query_pos,
+    )
     # Put reference and pocket into the same centered coordinate frame.
     reference_data.pos = reference_data.pos - reference_mean
 
@@ -417,7 +448,10 @@ def build_diffalign_example_train_payload(
             "seed": seed,
         },
     )
-
+    
+    payload["query_bond_index"] = query_bond_index.detach().cpu().long()
+    payload["query_bond_length"] = query_bond_length.detach().cpu().float()
+    
     return payload
 
 def _require_tensor(payload: dict[str, object], key: str) -> torch.Tensor:

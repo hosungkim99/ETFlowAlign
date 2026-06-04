@@ -71,6 +71,7 @@ class ETFlowAlignSampler:
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
             pocket_batch=batch.pocket_batch,
+            pocket_atom_type=batch.pocket_atom_type,
             query_node_attr=batch.query_node_attr,
             reference_node_attr=batch.reference_node_attr,
         )
@@ -97,6 +98,7 @@ class ETFlowAlignSampler:
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
             pocket_batch=batch.pocket_batch,
+            pocket_atom_type=batch.pocket_atom_type,
             query_node_attr=batch.query_node_attr,
             reference_node_attr=batch.reference_node_attr,
         )

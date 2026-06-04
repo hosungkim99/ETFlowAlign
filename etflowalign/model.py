@@ -38,7 +38,10 @@ class AlignmentBatch:
     reference_batch: Optional[Tensor] = None
     pocket_pos: Optional[Tensor] = None
     pocket_batch: Optional[Tensor] = None
+    pocket_atom_Type: Optional[Tensor] = None
     query_node_attr: Optional[Tensor] = None
+    query_bond_index: Optional[Tensor] = None
+    query_bond_length: Optional[Tensor] = None
     reference_node_attr: Optional[Tensor] = None
 
 
@@ -90,36 +93,111 @@ def _segment_mean(x: Tensor, batch: Tensor, num_graphs: int) -> Tensor:
 
 
 def build_radius_edges(pos: Tensor, batch: Tensor, cutoff: float, max_neighbors: int) -> Tensor:
-    """Build intra-graph radius edges with small-N dense fallback (self-contained)."""
-    # src/dst collect directed edges (i -> j) within each graph.
-    src, dst = [], []
-    num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
-    cutoff_sq = cutoff * cutoff
+    """Intra-graph radius edges, fully vectorized (no per-atom Python loop).
 
-    for g in range(num_graphs):
-        node_idx = torch.where(batch == g)[0]
-        if node_idx.numel() <= 1:
-            continue
-        p = pos[node_idx]  # Local coordinates for graph g: [Ng, 3]
-        diff = p[:, None, :] - p[None, :, :]
-        dist_sq = (diff * diff).sum(-1)
-        mask = (dist_sq <= cutoff_sq) & (
-            ~torch.eye(node_idx.numel(), device=pos.device, dtype=torch.bool)
-        )
-
-        for i in range(node_idx.numel()):
-            nbr_local = torch.where(mask[i])[0]
-            if nbr_local.numel() > max_neighbors:
-                d = dist_sq[i, nbr_local]
-                nbr_local = nbr_local[torch.argsort(d)[:max_neighbors]]
-            if nbr_local.numel() > 0:
-                src.append(node_idx[i].repeat(nbr_local.numel()))
-                dst.append(node_idx[nbr_local])
-
-    if not src:
+    Edge ``(i, j)`` means atom ``j`` is a neighbor of atom ``i`` (message j->i). For each
+    ``i`` only the ``max_neighbors`` nearest in-graph atoms within ``cutoff`` are kept.
+    """
+    n = pos.size(0)
+    if n == 0:
         return torch.empty(2, 0, dtype=torch.long, device=pos.device)
-    return torch.stack([torch.cat(src), torch.cat(dst)], dim=0)
 
+    diff = pos[:, None, :] - pos[None, :, :]  # [n, n, 3]
+    dist_sq = (diff * diff).sum(-1)  # [n, n]
+    same = batch[:, None] == batch[None, :]
+    eye = torch.eye(n, dtype=torch.bool, device=pos.device)
+    mask = same & (~eye) & (dist_sq <= cutoff * cutoff)
+
+    if 0 < max_neighbors < n:
+        d = dist_sq.masked_fill(~mask, float("inf"))
+        topk_idx = d.topk(min(max_neighbors, n), dim=1, largest=False).indices
+        keep = torch.zeros_like(mask)
+        keep.scatter_(1, topk_idx, True)
+        mask = mask & keep
+
+    i, j = mask.nonzero(as_tuple=True)
+    return torch.stack([i, j], dim=0)
+
+def build_cross_edges(
+    lig_pos: Tensor,
+    lig_batch: Tensor,
+    pkt_pos: Tensor,
+    pkt_batch: Tensor,
+    cutoff: float,
+    max_neighbors: int,
+) -> tuple[Tensor, Tensor]:
+    """Ligand->pocket edges within cutoff (same graph), fully vectorized.
+
+    Returns ``(lig_idx, pkt_idx)``; for each ligand atom only the ``max_neighbors`` nearest
+    in-graph pocket atoms within ``cutoff`` are kept.
+    """
+    empty = torch.empty(0, dtype=torch.long, device=lig_pos.device)
+    if pkt_pos is None or pkt_pos.numel() == 0 or lig_pos.numel() == 0:
+        return empty, empty
+
+    diff = lig_pos[:, None, :] - pkt_pos[None, :, :]  # [nl, npk, 3]
+    dist_sq = (diff * diff).sum(-1)  # [nl, npk]
+    same = lig_batch[:, None] == pkt_batch[None, :]
+    mask = same & (dist_sq <= cutoff * cutoff)
+
+    npk = pkt_pos.size(0)
+    if 0 < max_neighbors < npk:
+        d = dist_sq.masked_fill(~mask, float("inf"))
+        topk_idx = d.topk(min(max_neighbors, npk), dim=1, largest=False).indices
+        keep = torch.zeros_like(mask)
+        keep.scatter_(1, topk_idx, True)
+        mask = mask & keep
+
+    lig_idx, pkt_idx = mask.nonzero(as_tuple=True)
+    return lig_idx, pkt_idx
+
+
+class PocketInteraction(nn.Module):
+    """Cross message passing so ligand atoms can sense binding-site shape.
+
+    The pocket is fixed context (its atoms never move). For each ligand atom this
+    produces (a) an invariant feature update aggregated from nearby pocket atoms, and
+    (b) an equivariant pocket-shape vector ``sum_j w_ij (p_j - x_i)`` that gives the
+    rigid head directional information about the pocket surface (not just its centroid).
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        # used as the pocket node feature only when pocket atom types are unavailable
+        self.fallback_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, h_lig: Tensor, x_lig: Tensor, x_pkt: Tensor, h_pkt: Tensor, lig_idx: Tensor, pkt_idx: Tensor) -> tuple[Tensor, Tensor]:
+        """``h_pkt`` are per-pocket-atom features (atom-type embedding, or the fallback token)."""
+        n_lig = h_lig.size(0)
+        h_update = torch.zeros_like(h_lig)
+        vec = torch.zeros(n_lig, 3, device=h_lig.device, dtype=h_lig.dtype)
+        if lig_idx.numel() == 0:
+            return h_update, vec
+
+        rij = x_pkt[pkt_idx] - x_lig[lig_idx]  # [E, 3], ligand -> pocket
+        dij = safe_norm(rij, dim=-1, keepdim=True)  # [E, 1]
+        tok = self.pocket_token.unsqueeze(0).expand(lig_idx.size(0), -1)
+        feat = torch.cat([h_lig[lig_idx], tok, dij], dim=-1)
+
+        # Mean aggregation + sigmoid gate keep both outputs bounded regardless of how many
+        # pocket atoms a ligand atom sees (real pockets have 100-200 atoms). A plain sum
+        # made the pocket-shape vector explode -> huge rigid velocity -> NaN.
+        ones = torch.ones(lig_idx.size(0), 1, device=h_lig.device, dtype=h_lig.dtype)
+        deg = torch.zeros(n_lig, 1, device=h_lig.device, dtype=h_lig.dtype)
+        deg.index_add_(0, lig_idx, ones)
+        deg = deg.clamp_min(1.0)
+        
+        h_update.index_add_(0, lig_idx, self.msg_mlp(feat))
+        gate = torch.sigmoid(self.gate_mlp(feat))  # (0, 1): bounds each edge's vector contribution
+        vec.index_add_(0, lig_idx, gate * rij)     # |contribution| <= cutoff
+        return self.norm(h_update / deg), vec / deg
 
 class EquivariantBlock(nn.Module):
     """Simple EGNN-style block: scalar message + relative vector aggregation."""
@@ -155,7 +233,7 @@ class EquivariantBlock(nn.Module):
 
         i, j = edge_index[0], edge_index[1]
         rij = x[i] - x[j]
-        dij = torch.norm(rij, dim=-1, keepdim=True)
+        dij = safe_norm(rij, dim=-1, keepdim=True)  # safe_norm: finite gradient when rij == 0
 
         e_ij = self.phi_e(torch.cat([h[i], h[j], dij], dim=-1))
 
@@ -249,6 +327,12 @@ class ETFlowAlignModel(nn.Module):
         use_atom_index_embed: bool = False,
         use_direct_vector_head: bool = False,
         use_equivariant_basis_head: bool = False,
+        use_rigid_head: bool = False,
+        use_pocket_conditioning: bool = False,
+        pocket_cutoff: float = 8.0,
+        pocket_max_neighbors: int = 16,
+        use_node_attr: bool = False,
+        node_attr_dim: int = 5,
         max_atoms: int = 256,
     ) -> None:
         super().__init__()
@@ -259,8 +343,18 @@ class ETFlowAlignModel(nn.Module):
         self.use_atom_index_embed = bool(use_atom_index_embed)
         self.use_direct_vector_head = bool(use_direct_vector_head)
         self.use_equivariant_basis_head = bool(use_equivariant_basis_head)
+        self.use_rigid_head = bool(use_rigid_head)
+        self.use_pocket_conditioning = bool(use_pocket_conditioning)
+        self.pocket_cutoff = float(pocket_cutoff)
+        self.pocket_max_neighbors = int(pocket_max_neighbors)
         self.max_atoms = int(max_atoms)
 
+        if self.use_pocket_conditioning:
+            self.pocket_interaction = PocketInteraction(hidden_dim)
+
+        # rigid head gains a 5th basis (pocket-shape vector) when pocket conditioning is on
+        self._n_rigid_bases = 5 if self.use_pocket_conditioning else 4
+        
         if self.use_atom_index_embed:
             self.atom_index_embed = nn.Embedding(self.max_atoms, hidden_dim)
 
@@ -297,7 +391,26 @@ class ETFlowAlignModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, 4),
             )
-
+        # Rigid (direction A) head:
+        #   v_i = omega_g x (x_i - c_g) + v_lin_g
+        # A per-graph rigid-body velocity field (6 DOF per molecule). Because the field is
+        # a rigid motion by construction, integrating it cannot change any intramolecular
+        # distance: bond/angle geometry of the source conformer is preserved exactly.
+        # omega_g and v_lin_g are built as graph-pooled combinations of equivariant vector
+        # bases, so the field rotates with the input (E(3)-equivariant up to the reference
+        # direction conditioning in `in_proj`).
+        if self.use_rigid_head:
+            self.out_rigid_omega = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self._n_rigid_bases),
+            )
+            self.out_rigid_vlin = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self._n_rigid_bases),
+            )
+            
     def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor]:
         """Return direction and distance from query atoms to reference center."""
         if batch.reference_pos is None or batch.reference_batch is None or batch.reference_batch.numel() == 0:
@@ -307,7 +420,7 @@ class ETFlowAlignModel(nn.Module):
         num_graphs = int(batch.query_batch.max().item()) + 1
         ref_center = _segment_mean(batch.reference_pos, batch.reference_batch, num_graphs)
         delta = ref_center[batch.query_batch] - batch.query_pos
-        dist = torch.norm(delta, dim=-1, keepdim=True)
+        dist = safe_norm(delta, dim=-1, keepdim=True)
         direction = delta / dist.clamp_min(1e-8)
         return direction, dist
 
@@ -342,12 +455,14 @@ class ETFlowAlignModel(nn.Module):
         return pocket_center[batch.query_batch] - batch.query_pos
 
     def _neighbor_vector_basis(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        """Return query-query neighbor aggregate vector basis.
+        """Return query-query neighbor aggregate vector basis (mean over neighbors).
 
         Basis:
-            b_nbr,i = sum_{j in N(i)} (x_j - x_i)
+            b_nbr,i = mean_{j in N(i)} (x_j - x_i)
 
-        This vector is translation-invariant and rotation-equivariant.
+        Mean (not sum) keeps the magnitude bounded regardless of neighbor count; an
+        unbounded sum was a source of exploding omega -> NaN/huge loss on real data.
+        Translation-invariant and rotation-equivariant.
         """
         if edge_index.numel() == 0:
             return torch.zeros_like(x)
@@ -356,7 +471,9 @@ class ETFlowAlignModel(nn.Module):
         rij = x[j] - x[i]
         out = torch.zeros_like(x)
         out.index_add_(0, i, rij)
-        return out
+        deg = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
+        deg.index_add_(0, i, torch.ones(i.size(0), 1, device=x.device, dtype=x.dtype))
+        return out / deg.clamp_min(1.0)
 
     def _local_atom_index(self, query_batch: Tensor) -> Tensor:
         """Return graph-local atom indices for optional debug atom-index embeddings."""
@@ -382,10 +499,10 @@ class ETFlowAlignModel(nn.Module):
         """
         coeff = self.out_basis_coeff(h)  # [N, 4]
 
-        basis_query = x
+        basis_query = x_in
         basis_reference = self._reference_delta_basis(batch)
         basis_pocket = self._pocket_delta_basis(batch)
-        basis_neighbor = self._neighbor_vector_basis(x, edge_index)
+        basis_neighbor = self._neighbor_vector_basis(x_in, edge_index)
 
         bases = torch.stack(
             [
@@ -398,7 +515,57 @@ class ETFlowAlignModel(nn.Module):
         )  # [N, 4, 3]
 
         return (coeff.unsqueeze(-1) * bases).sum(dim=1)
+    def _rigid_head(
+        self,
+        h: Tensor,
+        x: Tensor,
+        x_in: Tensor,
+        batch: AlignmentBatch,
+        edge_index: Tensor,
+        pocket_basis: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Predict a per-graph rigid-body velocity field (direction A).
 
+        Steps:
+            1. Build equivariant per-atom vector bases (same set as the basis head).
+            2. Form per-atom omega/v_lin as invariant-scalar-weighted basis sums.
+            3. Pool to one omega_g and v_lin_g per graph (mean preserves equivariance).
+            4. Expand to a rigid field on the centered input coordinates:
+                   v_i = omega_g x (x_in_i - c_g) + v_lin_g
+
+        ``x_in`` are the centered *input* query coordinates (not the block-updated ``x``),
+        so the returned field is an exact rigid motion of the actual sampler state. The
+        equivariant bases are also built from ``x_in`` (and reference/pocket geometry):
+        the block-updated ``x`` is unnormalized and can grow across blocks, which makes
+        ``omega`` explode and the loss ill-conditioned. ``h`` still carries the learned
+        message-passing context as invariant coefficients.
+        """
+        num_graphs = int(batch.query_batch.max().item()) + 1
+
+        basis_list = [
+            x_in,                                       # query-centered coordinate
+            self._reference_delta_basis(batch),         # reference centroid -> query
+            self._pocket_delta_basis(batch),            # pocket centroid -> query
+            self._neighbor_vector_basis(x_in, edge_index),  # query neighbor aggregate
+        ]
+        if self.use_pocket_conditioning:
+            # pocket-shape vector (directional surface info, not just centroid)
+            basis_list.append(pocket_basis if pocket_basis is not None else torch.zeros_like(x_in))
+        bases = torch.stack(basis_list, dim=1)  # [N, n_bases, 3]
+
+        omega_atom = (self.out_rigid_omega(h).unsqueeze(-1) * bases).sum(dim=1)  # [N, 3]
+        vlin_atom = (self.out_rigid_vlin(h).unsqueeze(-1) * bases).sum(dim=1)  # [N, 3]
+
+        omega = _segment_mean(omega_atom, batch.query_batch, num_graphs)  # [G, 3]
+        vlin = _segment_mean(vlin_atom, batch.query_batch, num_graphs)  # [G, 3]
+
+        com = _segment_mean(x_in, batch.query_batch, num_graphs)  # [G, 3]
+        rel = x_in - com[batch.query_batch]  # [N, 3]
+        omega_i = omega[batch.query_batch]  # [N, 3]
+        vlin_i = vlin[batch.query_batch]  # [N, 3]
+
+        return torch.cross(omega_i, rel, dim=-1) + vlin_i
+    
     def forward(self, batch: AlignmentBatch, t_graph: Tensor) -> Tensor:
         """Predict query velocity field ``v_theta(x_t, t, cond)``.
 
@@ -415,7 +582,8 @@ class ETFlowAlignModel(nn.Module):
         num_graphs = int(batch.query_batch.max().item()) + 1
         com = _segment_mean(batch.query_pos, batch.query_batch, num_graphs)
         x = batch.query_pos - com[batch.query_batch]
-
+        x_in = x.clone()  # centered input coords, used by the rigid head
+        
         h_atom = self.atom_embed(batch.query_atom_type)
 
         if self.use_atom_index_embed:
@@ -429,6 +597,27 @@ class ETFlowAlignModel(nn.Module):
 
         h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))
 
+        # Pocket-shape conditioning: enrich ligand features and build a directional
+        # pocket-shape basis from the fixed binding-site atoms (in the ligand-COM frame).
+        pocket_basis = None
+        if (
+            self.use_pocket_conditioning
+            and batch.pocket_pos is not None
+            and batch.pocket_batch is not None
+            and batch.pocket_batch.numel() > 0
+        ):
+            xp = batch.pocket_pos - com[batch.pocket_batch]
+            if batch.pocket_atom_type is not None:
+                h_pkt = self.atom_embed(batch.pocket_atom_type)  # pocket chemistry (shared atom embedding)
+            else:
+                h_pkt = self.pocket_interaction.fallback_token.unsqueeze(0).expand(xp.size(0), -1)
+            lig_idx, pkt_idx = build_cross_edges(
+                x_in, batch.query_batch, xp, batch.pocket_batch,
+                self.pocket_cutoff, self.pocket_max_neighbors,
+            )
+            h_pocket, pocket_basis = self.pocket_interaction(h, x_in, xp, h_pkt, lig_idx, pkt_idx)
+            h = h + h_pocket
+        
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
 
         for block in self.blocks:
@@ -438,7 +627,11 @@ class ETFlowAlignModel(nn.Module):
         # This is intentionally non-equivariant and should be used for sanity checks only.
         if self.use_direct_vector_head:
             return self.out_vec(h)
-
+        
+        # Direction A: rigid-body velocity field (intramolecular geometry preserved exactly).
+        if self.use_rigid_head:
+            return self._rigid_head(h, x, x_in, batch, edge_index, pocket_basis)
+        
         # Production-compatible expressive equivariant head.
         if self.use_equivariant_basis_head:
             return self._equivariant_basis_head(h, x, batch, edge_index)

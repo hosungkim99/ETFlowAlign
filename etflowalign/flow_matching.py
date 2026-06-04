@@ -10,6 +10,50 @@ from torch import Tensor
 from .model import AlignmentBatch, ETFlowAlignModel
 from .validation import validate_alignment_batch
 
+def _rotation_to_axis_angle(rotation: Tensor) -> Tensor:
+    """Convert a column-convention rotation matrix ``[3,3]`` to an axis-angle vector ``[3]``.
+
+    The returned vector ``omega`` has direction = rotation axis and magnitude = rotation
+    angle, so ``exp(skew(omega)) == rotation``.
+    """
+    cos = ((rotation.diagonal().sum() - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.arccos(cos)
+    sin = torch.sin(theta)
+
+    if float(theta) < 1e-6:
+        return torch.zeros(3, device=rotation.device, dtype=rotation.dtype)
+
+    if float(sin.abs()) < 1e-6:
+        # theta near pi: (R + I)/2 = k k^T; recover axis from its largest diagonal entry.
+        a = (rotation + torch.eye(3, device=rotation.device, dtype=rotation.dtype)) * 0.5
+        diag = a.diagonal().clamp_min(0.0)
+        i = int(torch.argmax(diag))
+        axis = a[i] / torch.sqrt(diag[i]).clamp_min(1e-8)
+        axis = axis / axis.norm().clamp_min(1e-8)
+        return axis * theta
+
+    w = torch.stack(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ]
+    )
+    return (w / (2.0 * sin)) * theta
+
+
+def _axis_angle_to_matrix(omega: Tensor) -> Tensor:
+    """Rodrigues' formula: axis-angle vector ``[3]`` -> rotation matrix ``[3,3]`` (column convention)."""
+    eye = torch.eye(3, device=omega.device, dtype=omega.dtype)
+    theta = omega.norm()
+    if float(theta) < 1e-8:
+        return eye
+    k = omega / theta
+    skew = torch.zeros(3, 3, device=omega.device, dtype=omega.dtype)
+    skew[0, 1], skew[0, 2] = -k[2], k[1]
+    skew[1, 0], skew[1, 2] = k[2], -k[0]
+    skew[2, 0], skew[2, 1] = -k[1], k[0]
+    return eye + torch.sin(theta) * skew + (1.0 - torch.cos(theta)) * (skew @ skew)
 
 @dataclass
 class FlowMatchingConfig:
@@ -27,10 +71,17 @@ class FlowMatchingConfig:
     center_source: bool = True
     center_target: bool = True
     fixed_t: float | None = None
+    path_type: Literal["linear", "rigid"] = "linear"
 
 
 class AlignmentFlowMatcher:
     def __init__(self, config: FlowMatchingConfig) -> None:
+        if config.path_type == "rigid" and config.source_type != "input_query":
+            raise ValueError(
+                "path_type='rigid' requires source_type='input_query': the rigid path and "
+                "rigid-source inference both use query_pos as the source conformer. "
+                f"Got source_type={config.source_type!r}."
+            )
         self.config = config
 
     def sample_time(self, num_graphs: int, device: torch.device) -> Tensor:
@@ -126,10 +177,97 @@ class AlignmentFlowMatcher:
 
         mean = mean / count.clamp_min(1.0)
         return x - mean[batch_index]
-        
+    
+    def _build_rigid_training_state(
+        self,
+        batch: AlignmentBatch,
+        x0: Tensor,
+        x1: Tensor,
+        t_node: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """SE(3) geodesic path between source pose ``x0`` and target pose ``x1``.
+
+        For each graph the source and target are the same conformer in different rigid
+        poses, so the optimal rigid map (rotation ``R``, COM shift) is recovered by Kabsch.
+        The path interpolates rotation along the SO(3) geodesic and the COM linearly::
+
+            x_t = (x0 - c0) @ R(t).T + ((1 - t) c0 + t c1)
+            u_t = omega x (x_t - c(t)) + (c1 - c0)
+
+        where ``R(t) = exp(t * skew(omega))``. Every intermediate ``x_t`` is a rigid
+        transform of the source conformer, so intramolecular geometry is preserved exactly
+        and ``u_t`` is a pure rigid-body velocity field (matched by the rigid head).
+        """
+        x_t = torch.empty_like(x1)
+        u_t = torch.empty_like(x1)
+
+        for g in batch.query_batch.unique(sorted=True):
+            mask = batch.query_batch == g
+            p = x0[mask]
+            q = x1[mask]
+            t = t_node[mask][0]
+
+            c0 = p.mean(0, keepdim=True)
+            c1 = q.mean(0, keepdim=True)
+            c_t = (1.0 - t) * c0 + t * c1
+            pc = p - c0
+
+            if p.size(0) < 2:
+                x_t[mask] = pc + c_t
+                u_t[mask] = (c1 - c0).expand_as(p)
+                continue
+
+            qc = q - c1
+            h = pc.transpose(0, 1) @ qc
+            u_svd, _, vT = torch.linalg.svd(h)
+            r = vT.transpose(0, 1) @ u_svd.transpose(0, 1)
+            if torch.det(r) < 0:
+                vT = vT.clone()
+                vT[-1, :] *= -1
+                r = vT.transpose(0, 1) @ u_svd.transpose(0, 1)
+
+            # Kabsch ``r`` satisfies qc ~= pc @ r (row convention); the column-convention
+            # rotation is its transpose.
+            # With h = pc.T @ qc, Kabsch ``r = V @ U.T`` is the column-convention rotation
+            # mapping source onto target (r @ pc_col ~= qc_col); applied to row points: pc @ r.T.
+            omega = _rotation_to_axis_angle(r)
+            if not torch.isfinite(omega).all():
+                # Degenerate geometry (near-collinear/planar ligand, angle ~= pi) makes the
+                # axis-angle extraction unstable. Fall back to a translation-only path for
+                # this graph so one bad complex cannot NaN the whole batch.
+                x_t[mask] = pc + c_t
+                u_t[mask] = (c1 - c0).expand_as(p)
+                continue
+            r_t = _axis_angle_to_matrix(t * omega)
+
+            xt = pc @ r_t.transpose(0, 1) + c_t
+            rel = xt - c_t
+            x_t[mask] = xt
+            u_t[mask] = torch.cross(omega.unsqueeze(0).expand_as(rel), rel, dim=-1) + (c1 - c0)
+
+        # Final safety net: per-graph guards above cover the known degenerate cases, but any
+        # residual non-finite value (one bad complex in a large batch) is zeroed here so it
+        # can never NaN the loss for the whole batch.
+        x_t = torch.nan_to_num(x_t, nan=0.0, posinf=0.0, neginf=0.0)
+        u_t = torch.nan_to_num(u_t, nan=0.0, posinf=0.0, neginf=0.0)
+        return x_t, u_t
+    
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         validate_alignment_batch(batch, target_query_pos=target_query_pos, require_target=True)
         t_node = t_graph[batch.query_batch]
+        
+        
+        if self.config.path_type == "rigid":
+            # The rigid path uses the input query conformer directly as the source: it must
+            # be a valid conformer so that the source->target map is a rigid motion. A
+            # reference-anchored / gaussian source would be a random cloud (and would also
+            # make this path non-deterministic), so sample_source is intentionally bypassed.
+            # The path centers per graph and derives its own SE(3) geodesic, so source
+            # centering / harmonic prior / Kabsch pre-alignment / interpolant noise are all
+            # skipped too: each would either be redundant or break rigidity.
+            return self._build_rigid_training_state(
+                batch=batch, x0=batch.query_pos, x1=target_query_pos, t_node=t_node,
+            )
         x0 = self.sample_source(batch=batch, target_query_pos=target_query_pos)
         if self.config.center_source:
             x0 = self._center_by_graph(x0, batch.query_batch)
@@ -158,8 +296,37 @@ class AlignmentFlowMatcher:
         graph_cnt.index_add_(0, batch_index, torch.ones_like(per_atom))
         return (graph_sum / graph_cnt.clamp_min(1.0)).mean()
 
+def endpoint_bond_length_loss(
+    pred_v: Tensor,
+    x_t: Tensor,
+    t_graph: Tensor,
+    batch: AlignmentBatch,
+) -> Tensor:
+    """Bond length regularization on the one-step estimated endpoint x1_hat."""
+    if batch.query_bond_index is None or batch.query_bond_length is None:
+        return pred_v.sum() * 0.0
 
-def flow_matching_step(model: ETFlowAlignModel, matcher: AlignmentFlowMatcher, batch: AlignmentBatch, target_query_pos: Tensor) -> Tensor:
+    if batch.query_bond_index.numel() == 0:
+        return pred_v.sum() * 0.0
+
+    bond_index = batch.query_bond_index.to(device=x_t.device)
+    target_length = batch.query_bond_length.to(device=x_t.device, dtype=x_t.dtype)
+
+    i, j = bond_index[0], bond_index[1]
+    t_node = t_graph[batch.query_batch].unsqueeze(-1)
+
+    x1_hat = x_t + (1.0 - t_node) * pred_v
+    pred_length = torch.linalg.norm(x1_hat[i] - x1_hat[j], dim=-1)
+
+    return ((pred_length - target_length) ** 2).mean()
+
+def flow_matching_step(
+    model: ETFlowAlignModel,
+    matcher: AlignmentFlowMatcher,
+    batch: AlignmentBatch,
+    target_query_pos: Tensor,
+    lambda_bond: float = 0.0,
+    ) -> Tensor:
     validate_alignment_batch(batch, target_query_pos=target_query_pos, require_target=True)
     num_graphs = int(batch.query_batch.max().item()) + 1
     t_graph = matcher.sample_time(num_graphs=num_graphs, device=batch.query_pos.device)
@@ -173,6 +340,23 @@ def flow_matching_step(model: ETFlowAlignModel, matcher: AlignmentFlowMatcher, b
         reference_batch=batch.reference_batch,
         pocket_pos=batch.pocket_pos,
         pocket_batch=batch.pocket_batch,
+        pocket_atom_type=batch.pocket_atom_type,
+        query_node_attr=batch.query_node_attr,
+        reference_node_attr=batch.reference_node_attr,
+        query_bond_index=batch.query_bond_index,
+        query_bond_length=batch.query_bond_length,
     )
     pred_v = model(step_batch, t_graph=t_graph)
-    return matcher.loss(pred_v=pred_v, target_u=u_t, batch_index=batch.query_batch)
+    fm_loss = matcher.loss(pred_v=pred_v, target_u=u_t, batch_index=batch.query_batch)
+
+    if lambda_bond <= 0.0:
+        return fm_loss
+
+    bond_loss = endpoint_bond_length_loss(
+        pred_v=pred_v,
+        x_t=x_t,
+        t_graph=t_graph,
+        batch=batch,
+    )
+
+    return fm_loss + float(lambda_bond) * bond_loss
