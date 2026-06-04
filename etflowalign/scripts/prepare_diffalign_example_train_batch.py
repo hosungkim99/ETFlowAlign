@@ -67,12 +67,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Random seed for query_pos initialization.",
     )
     parser.add_argument(
-        "--keep-query-conformer-as-source",
-        action="store_true",
-        help=(
-            "Use centered query SDF conformer as query_pos instead of random N(0,I). "
-            "Default uses random source coordinates."
-        ),
+    "--keep-query-conformer-as-source",
+    action="store_true",
+    help=(
+        "Use centered query SDF conformer as query_pos instead of random N(0,I). "
+        "Default uses random source coordinates."
+    ),
     )
 
     return parser
@@ -120,6 +120,9 @@ def print_payload_summary(prefix: str, payload: dict[str, Any]) -> None:
         "pocket_pos",
         "pocket_batch",
         "reference_center_subtracted",
+        "randomize_query_pos",
+        "query_source",
+        "seed",
     ]
 
     for key in summary_keys:

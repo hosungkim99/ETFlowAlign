@@ -65,7 +65,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-query-conformer",
         action="store_true",
-        help="Use centered query SDF conformer coordinates instead of random N(0,I) coordinates.",
+        help="Use centered query SDF conformer as source instead of a rigid-randomized source.",
     )
 
     return parser
@@ -113,6 +113,7 @@ def print_payload_summary(prefix: str, payload: dict[str, Any]) -> None:
         "pocket_batch",
         "reference_center_subtracted",
         "randomize_query_pos",
+        "query_source",
         "seed",
     ]
 
