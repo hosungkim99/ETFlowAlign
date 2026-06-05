@@ -137,6 +137,10 @@ class FlowMatchingConfig:
         center_target (bool): 타겟을 그래프별 질량중심으로 중심화할지 여부.
         fixed_t (float | None): 지정 시 시간 t를 무작위 대신 고정값으로 사용(디버깅/특정 시점 학습).
         path_type (Literal): 확률경로 종류. "linear"=선형 보간+노이즈, "rigid"=SE(3) 지오데식.
+        stochastic_target (bool): linear 경로의 목표 속도에 브리지 노이즈 항(sigma_dot*eps)을
+            포함할지 여부. 기본 False는 결정적 OT 목표(u_t=x1-x0)를 사용해, 예측 불가능한
+            노이즈로 인한 손실 바닥/그래디언트 분산 폭증과 t->0,1 근방 sigma_dot 발산을
+            제거하여 학습 안정성을 높인다. True면 기존 브라운 브리지(확률) 목표를 사용한다.
     """
 
     sigma: float = 0.05
@@ -154,6 +158,7 @@ class FlowMatchingConfig:
     center_target: bool = True
     fixed_t: float | None = None
     path_type: Literal["linear", "rigid"] = "linear"
+    stochastic_target: bool = False
 
 
 class AlignmentFlowMatcher:
@@ -304,7 +309,8 @@ class AlignmentFlowMatcher:
             Tensor: 형상 ``[N]``의 노드별 노이즈 표준편차 시간 도함수.
 
         파이프라인 단계:
-            4단계(학습 목표/확률경로) - 선형 경로 목표 속도 ``u_t`` 의 노이즈 항 계산.
+            4단계(학습 목표/확률경로) - 선형 경로 목표 속도 ``u_t`` 의 노이즈 항 계산
+            (``stochastic_target=True`` 일 때만 사용된다).
         """
         denom = torch.sqrt((t_node * (1.0 - t_node)).clamp_min(1e-8))
         return self.config.sigma * 0.5 * (1.0 - 2.0 * t_node) / denom
@@ -622,8 +628,9 @@ class AlignmentFlowMatcher:
             - 그래프별 시간 ``t_graph`` 를 노드 시간 ``t_node`` 로 확장한다.
             - rigid: 입력 쿼리를 소스로 ``_build_rigid_training_state`` 호출(중심화/Kabsch/노이즈 생략).
             - linear: 소스 샘플링 -> (선택) 소스 중심화 -> 타겟 중심화 -> (선택) 하모닉 프라이어
-              -> (선택) Kabsch 정렬 후, 노이즈 ``eps`` 와 ``sigma_t``/``sigma_dot_t`` 로
-              ``x_t=(1-t)x0+t x1+sigma*eps``, ``u_t=(x1-x0)+sigma_dot*eps`` 를 만든다.
+              -> (선택) Kabsch 정렬 후, ``x_t=(1-t)x0+t x1+sigma*eps`` 를 만든다. 목표 속도는
+              ``stochastic_target=False``(기본)이면 결정적 OT 목표 ``u_t=x1-x0``, True이면 기존
+              브리지 목표 ``u_t=(x1-x0)+sigma_dot*eps`` 를 사용한다.
 
         파라미터:
             batch (AlignmentBatch): 쿼리/레퍼런스/포켓 정보를 담은 입력 배치.
@@ -662,9 +669,16 @@ class AlignmentFlowMatcher:
             x0 = self._kabsch_align_source_to_target(x0=x0, target_query_pos=x1, batch_index=batch.query_batch)
         eps = torch.randn_like(x1)
         sigma = self.sigma_t(t_node).unsqueeze(-1)
-        sigma_dot = self.sigma_dot_t(t_node).unsqueeze(-1)
         x_t = (1.0 - t_node).unsqueeze(-1) * x0 + t_node.unsqueeze(-1) * x1 + sigma * eps
-        u_t = (x1 - x0) + sigma_dot * eps
+        if self.config.stochastic_target:
+            # 기존 브라운 브리지(확률) 목표: x_t의 노이즈에 정합하는 sigma_dot*eps 항을 포함한다.
+            sigma_dot = self.sigma_dot_t(t_node).unsqueeze(-1)
+            u_t = (x1 - x0) + sigma_dot * eps
+        else:
+            # 결정적 OT 목표(기본): 목표 속도가 예측 가능(x1-x0)하므로 예측 불가능한
+            # 노이즈로 인한 손실 바닥/그래디언트 분산 폭증과 t->0,1 근방 sigma_dot 발산을
+            # 제거한다. sigma*eps는 x_t에만 남겨 입력 노이즈 증강으로 작동한다.
+            u_t = x1 - x0
         return x_t, u_t
 
     def loss(self, pred_v: Tensor, target_u: Tensor, batch_index: Tensor) -> Tensor:
