@@ -154,14 +154,15 @@ def parse_pocket_coords(pdb_path: str, drop_h: bool = True) -> tuple[torch.Tenso
         ATOM/HETATM 라인에서 원소/원자명으로 수소 여부를 판단하고, 좌표 필드를 float로 읽어 모은다.
     메커니즘:
         파일을 줄 단위로 읽으며 ATOM/HETATM만 처리한다. 컬럼 76:78의 원소(또는 원자명 첫 글자)로
-        수소를 식별해 drop_h이면 건너뛰고, 컬럼 30:54의 x/y/z를 float로 파싱해 누적한다.
+        수소를 식별해 drop_h이면 건너뛰고, 컬럼 30:54의 x/y/z를 float로 파싱해 누적한다. 동시에
+        원소 심볼을 주기율표로 원자번호로 변환해 좌표와 1:1로 누적한다(인식 불가 심볼은 0).
         좌표를 하나도 못 읽으면 예외를 던진다.
-        (주: docstring상 atom_type도 언급되나 구현은 좌표 텐서만 반환한다.)
     파라미터:
         pdb_path (str): 포켓 PDB 파일 경로.
         drop_h (bool): True이면 수소 원자를 제외한다.
     반환:
-        tuple[torch.Tensor, torch.Tensor] (타입 힌트 기준): 포켓 좌표 [Np,3] float 텐서.
+        tuple[torch.Tensor, torch.Tensor]: (포켓 좌표 [Np,3] float 텐서,
+            원자번호 [Np] long 텐서).
     예외:
         ValueError: 좌표를 하나도 파싱하지 못했을 때.
     파이프라인 단계:
@@ -183,10 +184,15 @@ def parse_pocket_coords(pdb_path: str, drop_h: bool = True) -> tuple[torch.Tenso
                 x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
             except ValueError:
                 continue
+            try:
+                atomic_num = periodic.GetAtomicNumber(symbol.capitalize())
+            except Exception:  # noqa: BLE001 - 인식 불가 심볼은 미지(0) 처리
+                atomic_num = 0
             coords.append([x, y, z])
+            atom_types.append(atomic_num)
     if not coords:
         raise ValueError(f"No atom coordinates parsed from pocket: {pdb_path}")
-    return torch.tensor(coords, dtype=torch.float32)
+    return torch.tensor(coords, dtype=torch.float32), torch.tensor(atom_types, dtype=torch.long)
 
 
 def ligand_atom_types_and_pos(mol: Chem.Mol) -> tuple[torch.Tensor, torch.Tensor]:

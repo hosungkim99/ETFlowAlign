@@ -58,7 +58,7 @@ class AlignmentBatch:
     reference_batch: Optional[Tensor] = None
     pocket_pos: Optional[Tensor] = None
     pocket_batch: Optional[Tensor] = None
-    pocket_atom_Type: Optional[Tensor] = None
+    pocket_atom_type: Optional[Tensor] = None
     query_node_attr: Optional[Tensor] = None
     query_bond_index: Optional[Tensor] = None
     query_bond_length: Optional[Tensor] = None
@@ -393,7 +393,7 @@ class PocketInteraction(nn.Module):
 
         rij = x_pkt[pkt_idx] - x_lig[lig_idx]  # [E, 3], ligand -> pocket
         dij = safe_norm(rij, dim=-1, keepdim=True)  # [E, 1]
-        tok = self.pocket_token.unsqueeze(0).expand(lig_idx.size(0), -1)
+        tok = h_pkt[pkt_idx]
         feat = torch.cat([h_lig[lig_idx], tok, dij], dim=-1)
 
         # 평균 집계 + 시그모이드 게이트는 리간드 원자가 보는 포켓 원자 수에 관계없이
@@ -1060,10 +1060,10 @@ class ETFlowAlignModel(nn.Module):
         """
         coeff = self.out_basis_coeff(h)  # [N, 4]
 
-        basis_query = x_in
+        basis_query = x
         basis_reference = self._reference_delta_basis(batch)
         basis_pocket = self._pocket_delta_basis(batch)
-        basis_neighbor = self._neighbor_vector_basis(x_in, edge_index)
+        basis_neighbor = self._neighbor_vector_basis(x, edge_index)
 
         bases = torch.stack(
             [

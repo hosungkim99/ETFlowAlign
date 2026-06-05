@@ -58,7 +58,7 @@ def load_alignment_batch_from_pt(path: str, require_target: bool, device: str | 
         reference_batch=raw.get("reference_batch"),
         pocket_pos=raw.get("pocket_pos"),
         pocket_batch=raw.get("pocket_batch"),
-        pocket_atom_Type=raw.get("pocket_atom_type"),
+        pocket_atom_type=raw.get("pocket_atom_type"),
         query_node_attr=raw.get("query_node_attr"),
         reference_node_attr=raw.get("reference_node_attr"),
         query_bond_index=raw.get("query_bond_index"),
