@@ -1,8 +1,8 @@
 # etflowalign/scripts/diagnose_sampling_trajectory.py
-"""Diagnose bond geometry along ETFlowAlign ODE sampling trajectory.
+"""ETFlowAlign ODE 샘플링 궤적을 따라 결합 기하 구조를 진단한다.
 
-This script runs ETFlowAlign sampling manually and reports intermediate
-geometry statistics at selected ODE steps.
+이 스크립트는 ETFlowAlign 샘플링을 수동으로 실행하고,
+선택된 ODE 스텝에서의 중간 기하 통계를 출력한다.
 
 Example:
     python -m etflowalign.scripts.diagnose_sampling_trajectory \
@@ -135,11 +135,11 @@ def make_step_batch(batch: AlignmentBatch, query_pos: torch.Tensor) -> Alignment
 
 
 def restore_global_if_needed(x: torch.Tensor, metadata: dict | None) -> torch.Tensor:
-    """Restore global coordinates only for metric comparison with query.sdf.
+    """query.sdf와의 지표 비교를 위해서만 전역 좌표를 복원한다.
 
-    export_candidates_to_sdf restores reference_center_subtracted before writing SDF.
-    This diagnostic compares intermediate states against query.sdf in global coordinates,
-    so it applies the same restoration when metadata has reference_center_subtracted.
+    export_candidates_to_sdf는 SDF 저장 전 reference_center_subtracted를 복원한다.
+    이 진단 스크립트는 중간 상태를 전역 좌표계의 query.sdf와 비교하므로,
+    metadata에 reference_center_subtracted가 있을 경우 동일한 복원 과정을 적용한다.
     """
     if not isinstance(metadata, dict):
         return x

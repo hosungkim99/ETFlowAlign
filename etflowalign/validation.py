@@ -1,4 +1,4 @@
-"""Batch validation utilities for ETFlowAlign."""
+"""ETFlowAlign 배치 유효성 검사 유틸리티."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def validate_alignment_batch(
     require_pocket: bool = False,
     require_target: bool = False,
 ) -> None:
-    """Validate batch structure and shapes before model/sampler execution."""
+    """모델/샘플러 실행 전에 배치 구조와 형상을 검증한다."""
     qpos = _require_tensor("query_pos", batch.query_pos)
     qtype = _require_tensor("query_atom_type", batch.query_atom_type)
     qbatch = _require_tensor("query_batch", batch.query_batch)

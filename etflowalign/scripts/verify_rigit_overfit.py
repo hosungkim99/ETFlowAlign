@@ -1,6 +1,6 @@
-"""Overfit a rigid model on one rigid (source -> target) pair, then check that
-few-step ODE inference (a) preserves intramolecular geometry and (b) converges to
-the target pose. This is the direct test of direction-A's goal.
+"""강체 모델을 하나의 강체 (소스 -> 타겟) 쌍에 오버피팅시킨 후,
+소수 스텝 ODE 추론이 (a) 분자 내부 기하 구조를 보존하고 (b) 타겟 포즈에 수렴하는지 검증한다.
+이것은 방향-A의 목표에 대한 직접적인 테스트다.
 """
 import torch
 
@@ -18,10 +18,10 @@ def main():
     torch.manual_seed(0)
     n = 14
     g = torch.Generator().manual_seed(7)
-    conformer = torch.randn(n, 3, generator=g) * 1.5          # valid internal geometry
+    conformer = torch.randn(n, 3, generator=g) * 1.5          # 유효한 내부 기하 구조
     R = _axis_angle_to_matrix(torch.randn(3, generator=g))
     t = torch.randn(3, generator=g) * 3.0
-    target = conformer @ R.transpose(0, 1) + t                 # rigid-transformed target pose
+    target = conformer @ R.transpose(0, 1) + t                 # 강체 변환된 타겟 포즈
     source = conformer.clone()
 
     atom_type = torch.randint(0, 16, (n,), generator=g)
@@ -32,7 +32,7 @@ def main():
             query_pos=qpos,
             query_atom_type=atom_type,
             query_batch=zero_batch,
-            reference_pos=target,                              # align toward target pose
+            reference_pos=target,                              # 타겟 포즈를 향해 정렬
             reference_atom_type=atom_type,
             reference_batch=zero_batch,
         )

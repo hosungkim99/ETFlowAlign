@@ -1,4 +1,4 @@
-"""Flow-matching objective and alignment-specific probability path for ETFlowAlign."""
+"""ETFlowAlign의 플로우 매칭 목적함수 및 정렬 특화 확률 경로."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,10 +11,10 @@ from .model import AlignmentBatch, ETFlowAlignModel
 from .validation import validate_alignment_batch
 
 def _rotation_to_axis_angle(rotation: Tensor) -> Tensor:
-    """Convert a column-convention rotation matrix ``[3,3]`` to an axis-angle vector ``[3]``.
+    """열 우선(column-convention) 회전 행렬 ``[3,3]``을 축-각도 벡터 ``[3]``으로 변환한다.
 
-    The returned vector ``omega`` has direction = rotation axis and magnitude = rotation
-    angle, so ``exp(skew(omega)) == rotation``.
+    반환되는 벡터 ``omega``는 방향이 회전축이고 크기가 회전각이므로,
+    ``exp(skew(omega)) == rotation``이 성립한다.
     """
     cos = ((rotation.diagonal().sum() - 1.0) * 0.5).clamp(-1.0, 1.0)
     theta = torch.arccos(cos)
@@ -24,7 +24,7 @@ def _rotation_to_axis_angle(rotation: Tensor) -> Tensor:
         return torch.zeros(3, device=rotation.device, dtype=rotation.dtype)
 
     if float(sin.abs()) < 1e-6:
-        # theta near pi: (R + I)/2 = k k^T; recover axis from its largest diagonal entry.
+        # theta가 pi에 가까울 때: (R + I)/2 = k k^T; 가장 큰 대각 원소로 축을 복원한다.
         a = (rotation + torch.eye(3, device=rotation.device, dtype=rotation.dtype)) * 0.5
         diag = a.diagonal().clamp_min(0.0)
         i = int(torch.argmax(diag))
@@ -43,7 +43,7 @@ def _rotation_to_axis_angle(rotation: Tensor) -> Tensor:
 
 
 def _axis_angle_to_matrix(omega: Tensor) -> Tensor:
-    """Rodrigues' formula: axis-angle vector ``[3]`` -> rotation matrix ``[3,3]`` (column convention)."""
+    """로드리게스 공식: 축-각도 벡터 ``[3]`` -> 회전 행렬 ``[3,3]`` (열 우선 표기법)."""
     eye = torch.eye(3, device=omega.device, dtype=omega.dtype)
     theta = omega.norm()
     if float(theta) < 1e-8:
@@ -185,18 +185,18 @@ class AlignmentFlowMatcher:
         x1: Tensor,
         t_node: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """SE(3) geodesic path between source pose ``x0`` and target pose ``x1``.
+        """소스 포즈 ``x0``와 타겟 포즈 ``x1`` 사이의 SE(3) 지오데식 경로.
 
-        For each graph the source and target are the same conformer in different rigid
-        poses, so the optimal rigid map (rotation ``R``, COM shift) is recovered by Kabsch.
-        The path interpolates rotation along the SO(3) geodesic and the COM linearly::
+        각 그래프에서 소스와 타겟은 서로 다른 강체 포즈를 가진 동일한 컨포머이므로,
+        최적 강체 사상(회전 ``R``, 질량중심 이동)은 Kabsch 알고리즘으로 복원된다.
+        경로는 SO(3) 지오데식을 따라 회전을 보간하고 질량중심은 선형으로 보간한다::
 
             x_t = (x0 - c0) @ R(t).T + ((1 - t) c0 + t c1)
             u_t = omega x (x_t - c(t)) + (c1 - c0)
 
-        where ``R(t) = exp(t * skew(omega))``. Every intermediate ``x_t`` is a rigid
-        transform of the source conformer, so intramolecular geometry is preserved exactly
-        and ``u_t`` is a pure rigid-body velocity field (matched by the rigid head).
+        여기서 ``R(t) = exp(t * skew(omega))``이다. 모든 중간 ``x_t``는 소스 컨포머의
+        강체 변환이므로 분자 내부 기하구조가 정확히 보존되고, ``u_t``는 순수 강체 속도장
+        (강체 헤드가 매칭)이다.
         """
         x_t = torch.empty_like(x1)
         u_t = torch.empty_like(x1)
@@ -226,15 +226,14 @@ class AlignmentFlowMatcher:
                 vT[-1, :] *= -1
                 r = vT.transpose(0, 1) @ u_svd.transpose(0, 1)
 
-            # Kabsch ``r`` satisfies qc ~= pc @ r (row convention); the column-convention
-            # rotation is its transpose.
-            # With h = pc.T @ qc, Kabsch ``r = V @ U.T`` is the column-convention rotation
-            # mapping source onto target (r @ pc_col ~= qc_col); applied to row points: pc @ r.T.
+            # Kabsch ``r``은 qc ~= pc @ r (행 우선)을 만족하며, 열 우선 회전은 그 전치이다.
+            # h = pc.T @ qc일 때, Kabsch ``r = V @ U.T``는 소스를 타겟으로 매핑하는
+            # 열 우선 회전이다 (r @ pc_col ~= qc_col); 행 포인트에 적용: pc @ r.T.
             omega = _rotation_to_axis_angle(r)
             if not torch.isfinite(omega).all():
-                # Degenerate geometry (near-collinear/planar ligand, angle ~= pi) makes the
-                # axis-angle extraction unstable. Fall back to a translation-only path for
-                # this graph so one bad complex cannot NaN the whole batch.
+                # 퇴화된 기하구조(거의 공선/평면 리간드, 각도 ~= pi)는 축-각도 추출을
+                # 불안정하게 만든다. 하나의 불량 복합체가 배치 전체를 NaN으로 만들지 않도록
+                # 이 그래프에 대해 이동만 하는 경로로 폴백한다.
                 x_t[mask] = pc + c_t
                 u_t[mask] = (c1 - c0).expand_as(p)
                 continue
@@ -245,9 +244,9 @@ class AlignmentFlowMatcher:
             x_t[mask] = xt
             u_t[mask] = torch.cross(omega.unsqueeze(0).expand_as(rel), rel, dim=-1) + (c1 - c0)
 
-        # Final safety net: per-graph guards above cover the known degenerate cases, but any
-        # residual non-finite value (one bad complex in a large batch) is zeroed here so it
-        # can never NaN the loss for the whole batch.
+        # 최종 안전망: 위의 그래프별 가드가 알려진 퇴화 케이스를 처리하지만,
+        # 남아 있는 비정상 값(큰 배치에서 불량 복합체 하나)을 여기서 0으로 만들어
+        # 배치 전체의 손실을 NaN으로 만들지 않는다.
         x_t = torch.nan_to_num(x_t, nan=0.0, posinf=0.0, neginf=0.0)
         u_t = torch.nan_to_num(u_t, nan=0.0, posinf=0.0, neginf=0.0)
         return x_t, u_t
@@ -255,16 +254,15 @@ class AlignmentFlowMatcher:
     def build_training_state(self, batch: AlignmentBatch, target_query_pos: Tensor, t_graph: Tensor) -> tuple[Tensor, Tensor]:
         validate_alignment_batch(batch, target_query_pos=target_query_pos, require_target=True)
         t_node = t_graph[batch.query_batch]
-        
-        
+
+
         if self.config.path_type == "rigid":
-            # The rigid path uses the input query conformer directly as the source: it must
-            # be a valid conformer so that the source->target map is a rigid motion. A
-            # reference-anchored / gaussian source would be a random cloud (and would also
-            # make this path non-deterministic), so sample_source is intentionally bypassed.
-            # The path centers per graph and derives its own SE(3) geodesic, so source
-            # centering / harmonic prior / Kabsch pre-alignment / interpolant noise are all
-            # skipped too: each would either be redundant or break rigidity.
+            # rigid 경로는 입력 쿼리 컨포머를 소스로 직접 사용한다: 소스->타겟 맵이
+            # 강체 운동이 되려면 유효한 컨포머여야 한다. reference_anchored / gaussian
+            # 소스는 무작위 포인트 클라우드가 되어 (비결정적이기도 하므로) sample_source를
+            # 의도적으로 우회한다. 경로는 그래프별로 중심화하고 자체 SE(3) 지오데식을
+            # 유도하므로, 소스 중심화 / 하모닉 프라이어 / Kabsch 사전 정렬 / 보간 노이즈는
+            # 모두 불필요하거나 강체성을 깨뜨리므로 건너뛴다.
             return self._build_rigid_training_state(
                 batch=batch, x0=batch.query_pos, x1=target_query_pos, t_node=t_node,
             )
@@ -302,7 +300,7 @@ def endpoint_bond_length_loss(
     t_graph: Tensor,
     batch: AlignmentBatch,
 ) -> Tensor:
-    """Bond length regularization on the one-step estimated endpoint x1_hat."""
+    """한 스텝 추정 엔드포인트 x1_hat에 대한 결합 길이 정규화."""
     if batch.query_bond_index is None or batch.query_bond_length is None:
         return pred_v.sum() * 0.0
 

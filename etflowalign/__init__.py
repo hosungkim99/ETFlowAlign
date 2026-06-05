@@ -1,7 +1,7 @@
-"""Public API for ETFlowAlign.
+"""ETFlowAlign의 공개 API.
 
-This module re-exports the main classes/functions so users can import from
-``etflowalign`` directly without navigating submodules.
+이 모듈은 주요 클래스/함수를 재내보내어, 사용자가
+``etflowalign``에서 서브모듈을 탐색하지 않고 직접 임포트할 수 있도록 한다.
 """
 
 from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig, flow_matching_step

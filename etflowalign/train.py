@@ -1,4 +1,4 @@
-"""Training script and utilities for ETFlowAlign.
+"""ETFlowAlign 학습 스크립트 및 유틸리티.
 
 Examples:
     python -m etflowalign.train --synthetic-smoke --steps 2 --batch-size 2 --n-atoms 8 --save-path /tmp/etflowalign_smoke.pt
@@ -24,7 +24,7 @@ from .model import AlignmentBatch, ETFlowAlignModel
 
 @dataclass
 class TrainConfig:
-    """Optimization hyperparameters for ETFlowAlign training."""
+    """ETFlowAlign 학습을 위한 최적화 하이퍼파라미터."""
 
     lr: float = 1e-4
     weight_decay: float = 0.0
@@ -36,7 +36,7 @@ def build_training_components(
     train_config: TrainConfig,
     fm_config: FlowMatchingConfig,
 ) -> tuple[AlignmentFlowMatcher, optim.Optimizer]:
-    """Create flow matcher and optimizer."""
+    """플로우 매처와 옵티마이저를 생성한다."""
     matcher = AlignmentFlowMatcher(config=fm_config)
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     return matcher, optimizer
@@ -50,7 +50,7 @@ def train_step(
     target_query_pos: Tensor,
     lambda_bond: float = 0.0,
 ) -> float:
-    """Run one optimization step and return scalar loss."""
+    """최적화 스텝을 한 번 실행하고 스칼라 손실값을 반환한다."""
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -64,17 +64,17 @@ def train_step(
 
     loss_check = float(loss.detach())
     if not math.isfinite(loss_check) or abs(loss_check) > 1e4:
-        # Skip non-finite OR exploding losses (normal loss is ~10-200). Raising here
-        # bypasses backward/step so one runaway batch cannot corrupt the weights; the
-        # caller rolls back to the best checkpoint and continues.
+        # 비정상(NaN/Inf)이거나 폭발하는 손실값(정상 손실은 ~10-200)을 건너뛴다. 여기서
+        # 예외를 발생시키면 backward/step을 우회하므로 하나의 이상 배치가 가중치를 오염시키지
+        # 않는다; 호출자는 최적 체크포인트로 롤백하고 학습을 계속한다.
         raise FloatingPointError(f"Non-finite/exploding training loss before backward: {loss_check}")
 
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-    # Sanitize non-finite gradients before stepping. clip_grad_norm_ does NOT guard against
-    # this: a single NaN/Inf gradient makes its total_norm NaN and then poisons every weight,
-    # so the next forward pass produces NaN and training dies. Zeroing the bad grads turns a
-    # rare unstable step into a no-op instead of a crash.
+    # 스텝 실행 전에 비정상 그래디언트를 정제한다. clip_grad_norm_은 이를 막지 못한다.
+    # NaN/Inf 그래디언트가 하나라도 있으면 total_norm이 NaN이 되어 모든 가중치를 오염시키고,
+    # 다음 순전파에서 NaN이 발생해 학습이 종료된다. 잘못된 그래디언트를 0으로 만들면
+    # 드물게 발생하는 불안정한 스텝이 크래시 대신 아무 효과 없는 연산으로 처리된다.
     for param in model.parameters():
         if param.grad is not None:
             torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
@@ -90,7 +90,7 @@ def train_step(
 
 
 def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.device) -> tuple[AlignmentBatch, Tensor]:
-    """Create toy alignment batch for smoke tests."""
+    """스모크 테스트용 간단한 정렬 배치를 생성한다."""
     query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)
     reference_batch = query_batch.clone()
 
@@ -114,7 +114,7 @@ def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.
 
 
 def _clone_state_dict_to_cpu(model: ETFlowAlignModel) -> dict[str, torch.Tensor]:
-    """Clone model parameters to CPU for checkpointing."""
+    """체크포인트 저장을 위해 모델 파라미터를 CPU로 복제한다."""
     return {
         key: value.detach().cpu().clone()
         for key, value in model.state_dict().items()
@@ -122,7 +122,7 @@ def _clone_state_dict_to_cpu(model: ETFlowAlignModel) -> dict[str, torch.Tensor]
 
 
 def _make_best_checkpoint_path(save_path: str) -> Path:
-    """Create best-checkpoint path from final checkpoint path."""
+    """최종 체크포인트 경로로부터 최적 체크포인트 경로를 생성한다."""
     path = Path(save_path)
     if path.suffix == ".pt":
         return path.with_name(f"{path.stem}_best{path.suffix}")
@@ -130,7 +130,7 @@ def _make_best_checkpoint_path(save_path: str) -> Path:
 
 
 def run_training(args: argparse.Namespace) -> None:
-    """CLI training entrypoint."""
+    """CLI 학습 진입점."""
     device = torch.device(args.device)
 
     model_args = {
@@ -252,8 +252,8 @@ def run_training(args: argparse.Namespace) -> None:
             consecutive_failures += 1
             if best_model_state is None or consecutive_failures > max_consecutive_failures:
                 raise
-            # Recover instead of aborting: roll back to the best weights (already on disk),
-            # reset optimizer momentum, and keep going. The best checkpoint is never lost.
+            # 중단 대신 복구: 최적 가중치(이미 디스크에 저장됨)로 롤백하고,
+            # 옵티마이저 모멘텀을 초기화한 후 학습을 계속한다. 최적 체크포인트는 절대 손실되지 않는다.
             print(
                 f"[train] step={step:04d} {exc} "
                 f"restoring best@{best_step} (loss={best_loss:.6f}) and continuing."
@@ -269,7 +269,7 @@ def run_training(args: argparse.Namespace) -> None:
             best_loss = final_loss
             best_step = step
             best_model_state = _clone_state_dict_to_cpu(model)
-            # Persist the best immediately so a later crash cannot throw it away.
+            # 이후 크래시로 인해 손실되지 않도록 최적 체크포인트를 즉시 저장한다.
             torch.save(
                 _checkpoint(best_model_state, {"best_loss": best_loss, "best_step": best_step}),
                 best_path,
@@ -325,7 +325,7 @@ def run_training(args: argparse.Namespace) -> None:
     )
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Define training CLI."""
+    """학습 CLI를 정의한다."""
     p = argparse.ArgumentParser(description="Train ETFlowAlign.")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--steps", type=int, default=200)
@@ -422,7 +422,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """CLI main."""
+    """CLI 메인 함수."""
     args = build_argparser().parse_args()
     sources = [bool(args.synthetic_smoke), bool(args.train_data), bool(args.train_dir)]
     if sum(sources) != 1:

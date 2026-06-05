@@ -1,4 +1,4 @@
-"""Numeric verification of the direction-A rigid path and rigid head.
+"""방향-A 강체 경로(rigid path)와 강체 헤드(rigid head)의 수치 검증.
 
 Run: python -m etflowalign.smoke_tests.99_scratch_or_old.verify_rigid_path
 """
@@ -20,11 +20,11 @@ def _pairwise(x):
 def make_rigid_pair(n=12, seed=0):
     g = torch.Generator().manual_seed(seed)
     p = torch.randn(n, 3, generator=g)
-    # random proper rotation
+    # 임의의 진정 회전(proper rotation)
     omega = torch.randn(3, generator=g)
-    R = _axis_angle_to_matrix(omega)  # column convention
+    R = _axis_angle_to_matrix(omega)  # 열 벡터 기준(column convention)
     t = torch.randn(3, generator=g) * 2.0
-    q = p @ R.transpose(0, 1) + t  # apply column rotation to rows
+    q = p @ R.transpose(0, 1) + t  # 행 벡터에 열 회전 적용
     return p, q
 
 
@@ -66,7 +66,7 @@ def test_rigid_path():
             endpoint0 = float((x_t - p).abs().max())
         if t == 1.0:
             endpoint1 = float((x_t - q).abs().max())
-        # finite-difference check of u_t against dx_t/dt (skip endpoints)
+        # u_t를 dx_t/dt의 유한 차분으로 검증 (끝점 제외)
         if 0.0 < t < 1.0:
             h = 1e-4
             xp, _ = matcher._build_rigid_training_state(batch, p, q, torch.full((n,), t + h))

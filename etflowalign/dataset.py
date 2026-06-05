@@ -1,13 +1,13 @@
-"""Multi-example dataset + collation for ETFlowAlign.
+"""ETFlowAlign을 위한 다중 예제 데이터셋 및 콜레이션.
 
-A dataset is a set of per-complex ``.pt`` payloads (the same schema produced by
-``diffalign_adapter`` / the PDBbind extractor): each holds one complex with
-``query_pos``, ``query_atom_type``, ``target_query_pos`` and optional
-``reference_*`` / ``pocket_*`` / bond fields.
+데이터셋은 복합체별 ``.pt`` 페이로드의 집합이다(``diffalign_adapter`` / PDBbind
+추출기가 생성하는 동일한 스키마): 각 파일은 ``query_pos``, ``query_atom_type``,
+``target_query_pos`` 및 선택적 ``reference_*`` / ``pocket_*`` / 결합 필드를
+포함하는 하나의 복합체를 담는다.
 
-This module turns those single-complex payloads into batched, multi-graph
-``AlignmentBatch`` objects the model already understands, with a conditioning
-switch so the same data can be trained pocket-only, reference-only, or both.
+이 모듈은 단일 복합체 페이로드를 모델이 이미 이해하는 배치형 멀티-그래프
+``AlignmentBatch`` 객체로 변환하며, 동일한 데이터를 포켓 전용, 레퍼런스 전용,
+또는 둘 다로 학습할 수 있는 컨디셔닝 스위치를 제공한다.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ Conditioning = Literal["pocket", "reference", "both"]
 
 
 class AlignmentDataset:
-    """Lazy dataset over a list of per-complex ``.pt`` payload paths."""
+    """복합체별 ``.pt`` 페이로드 경로 목록에 대한 지연 로딩 데이터셋."""
 
     def __init__(self, paths: list[str], require_target: bool = True) -> None:
         if not paths:
@@ -42,7 +42,7 @@ class AlignmentDataset:
         batch, target, _ = load_alignment_batch_from_pt(
             self.paths[index],
             require_target=self.require_target,
-            device=None,  # collation/move-to-device happens later
+            device=None,  # 콜레이션/디바이스 이동은 나중에 수행된다
         )
         return batch, target
 
@@ -57,7 +57,7 @@ def train_val_split(
     val_fraction: float = 0.1,
     seed: int = 0,
 ) -> tuple[list[str], list[str]]:
-    """Deterministic random split of payload paths into (train, val)."""
+    """페이로드 경로를 (train, val)로 결정론적 무작위 분할한다."""
     if not 0.0 <= val_fraction < 1.0:
         raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}.")
     ordered = sorted(paths)
@@ -71,7 +71,7 @@ def train_val_split(
 
 
 def apply_conditioning(batch: AlignmentBatch, conditioning: Conditioning) -> AlignmentBatch:
-    """Mask reference and/or pocket fields so the model trains on the chosen signal."""
+    """모델이 선택된 신호로 학습하도록 reference 및/또는 pocket 필드를 마스킹한다."""
     drop: dict[str, None] = {}
     if conditioning == "pocket":
         drop = {"reference_pos": None, "reference_atom_type": None, "reference_batch": None, "reference_node_attr": None}
@@ -93,11 +93,11 @@ def collate_alignment(
     conditioning: Conditioning = "both",
     device: str | torch.device | None = None,
 ) -> tuple[AlignmentBatch, Optional[Tensor]]:
-    """Merge single-complex examples into one multi-graph ``AlignmentBatch``.
+    """단일 복합체 예제들을 하나의 멀티-그래프 ``AlignmentBatch``로 합친다.
 
-    Each input example is treated as graph ``g`` (0..B-1). Node tensors are
-    concatenated; ``*_batch`` indices and ``query_bond_index`` are re-offset so
-    the merged batch is internally consistent.
+    각 입력 예제는 그래프 ``g`` (0..B-1)로 취급된다. 노드 텐서는 이어 붙이고;
+    ``*_batch`` 인덱스와 ``query_bond_index``는 병합된 배치가 내부적으로
+    일관성을 유지하도록 오프셋이 재조정된다.
     """
     if not items:
         raise ValueError("collate_alignment received no items.")
@@ -112,7 +112,7 @@ def collate_alignment(
         dim=0,
     )
 
-    # atom offsets per graph for bond-index remapping
+    # 결합 인덱스 재매핑을 위한 그래프별 원자 오프셋
     atom_counts = [b.query_pos.size(0) for b in batches]
     atom_offsets = [0]
     for n in atom_counts[:-1]:
@@ -140,7 +140,7 @@ def collate_alignment(
     pocket_atom_type = cat_node("pocket_atom_type") if pocket_pos is not None else None
     query_node_attr = cat_node("query_node_attr")
 
-    # bonds: offset each graph's atom indices, then concatenate
+    # 결합: 각 그래프의 원자 인덱스에 오프셋을 적용한 후 이어 붙인다
     bond_indices = [b.query_bond_index for b in batches]
     bond_lengths = [b.query_bond_length for b in batches]
     if _all_present(bond_indices) and _all_present(bond_lengths):
@@ -193,7 +193,7 @@ def sample_training_batch(
     device: str | torch.device | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[AlignmentBatch, Optional[Tensor]]:
-    """Randomly draw ``batch_size`` complexes and collate them (with replacement-free draw)."""
+    """``batch_size``개의 복합체를 비복원 추출로 무작위 선택하여 콜레이션한다."""
     n = len(dataset)
     k = min(batch_size, n)
     idx = torch.randperm(n, generator=generator)[:k].tolist()

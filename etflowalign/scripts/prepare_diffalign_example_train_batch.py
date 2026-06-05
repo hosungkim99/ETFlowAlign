@@ -1,9 +1,9 @@
 # etflowalign/scripts/prepare_diffalign_example_train_batch.py
-"""Create an ETFlowAlign pseudo-training .pt batch from the DiffAlign example.
+"""DiffAlign 예제에서 ETFlowAlign 유사 학습용 .pt 배치를 생성한다.
 
-This script uses the original query SDF conformer as target_query_pos after
-centering it by the reference ligand center. This is intended for smoke testing
-and single-example overfitting, not for real supervised training.
+이 스크립트는 레퍼런스 리간드 중심으로 센터링한 후 원본 쿼리 SDF 컨포머를
+target_query_pos로 사용한다. 스모크 테스트 및 단일 예제 오버피팅을 위한 것이며,
+실제 지도 학습에는 사용하지 않는다.
 
 Example:
     python -m etflowalign.scripts.prepare_diffalign_example_train_batch \

@@ -1,13 +1,14 @@
 # etflowalign/scripts/evaluate_dataset.py
-"""Evaluate an ETFlowAlign checkpoint on a set of complexes: pose RMSD + geometry.
+"""ETFlowAlign 체크포인트를 복합체 집합에 대해 평가한다: 포즈 RMSD + 기하 구조.
 
-For each complex we sample a pose from the stored (rigid-randomized) source and measure
-atomwise RMSD to the target bound pose (same frame, known correspondence), plus COM
-distance and bond geometry. Reports the distribution and success fractions.
+각 복합체에 대해 저장된 (강체 무작위화된) 소스에서 포즈를 샘플링하고,
+타겟 결합 포즈(동일 프레임, 알려진 대응관계)에 대한 원자 단위 RMSD,
+COM 거리, 결합 기하 구조를 측정한다. 분포와 성공률을 보고한다.
 
-NOTE: a true generalization number requires complexes the model did NOT train on. Use
-``--val-fraction``/``--seed``/``--split val`` to deterministically pick the same held-out
-subset that ``train.py --val-fraction`` holds out, or point ``--data-dir`` at a separate set.
+NOTE: 진정한 일반화 수치를 얻으려면 모델이 학습하지 않은 복합체가 필요하다.
+``--val-fraction``/``--seed``/``--split val``을 사용하면 ``train.py --val-fraction``이
+보류한 것과 동일한 검증 서브셋을 결정론적으로 선택하거나,
+``--data-dir``을 별도의 데이터셋으로 지정할 수 있다.
 
 Example:
     python -m etflowalign.scripts.evaluate_dataset \
@@ -85,7 +86,7 @@ def main() -> None:
         n_steps=args.n_steps,
         solver=args.solver,
         device=device,
-        limit=0,  # gather_paths already applied --limit
+        limit=0,  # gather_paths에서 --limit이 이미 적용됨
     )
     if summary.get("n", 0) == 0:
         print("[eval] no complexes evaluated.")

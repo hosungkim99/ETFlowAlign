@@ -1,5 +1,5 @@
 # etflowalign/scripts/diagnose_vector_field.py
-"""Simple vector-field diagnostic for ETFlowAlign checkpoints.
+"""ETFlowAlign 체크포인트에 대한 간단한 벡터 필드 진단 스크립트.
 
 Example:
     python -m etflowalign.scripts.diagnose_vector_field \

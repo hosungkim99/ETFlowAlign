@@ -24,10 +24,10 @@ candidate_000.sdf, candidate_001.sdf 저장
 '''
 
 def load_pt(path: str | Path) -> dict[str, Any]:
-    """Load an ETFlowAlign .pt output file.
+    """ETFlowAlign .pt 출력 파일을 로드한다.
 
-    The file is produced by our own pipeline, so weights_only=False is used
-    explicitly to avoid future-default ambiguity.
+    이 파일은 자체 파이프라인에서 생성되므로, 향후 기본값 변경에 따른
+    모호함을 피하기 위해 weights_only=False를 명시적으로 사용한다.
     """
     path = Path(path)
     if not path.exists():
@@ -56,7 +56,7 @@ def load_pt(path: str | Path) -> dict[str, Any]:
 
 
 def load_query_mol(path: str | Path, *, sanitize: bool = True, remove_hs: bool = True) -> Chem.Mol:
-    """Load query ligand template molecule from SDF/MOL."""
+    """SDF/MOL 파일에서 쿼리 리간드 템플릿 분자를 로드한다."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Query molecule file not found: {path}")
@@ -79,7 +79,7 @@ def load_query_mol(path: str | Path, *, sanitize: bool = True, remove_hs: bool =
 
 
 def set_mol_positions(mol: Chem.Mol, coords: torch.Tensor) -> Chem.Mol:
-    """Return a copy of mol with conformer positions set to coords[N,3]."""
+    """coords[N,3]로 컨포머 좌표를 설정한 mol의 복사본을 반환한다."""
     coords = coords.detach().cpu().float()
 
     if coords.ndim != 2 or coords.shape[-1] != 3:
@@ -107,7 +107,7 @@ def set_mol_positions(mol: Chem.Mol, coords: torch.Tensor) -> Chem.Mol:
 
 
 def get_query_sdf_from_metadata(obj: dict[str, Any]) -> str | None:
-    """Extract query_sdf path from ETFlowAlign output metadata."""
+    """ETFlowAlign 출력 메타데이터에서 query_sdf 경로를 추출한다."""
     metadata = obj.get("metadata", {})
     if not isinstance(metadata, dict):
         return None
@@ -124,7 +124,7 @@ def get_query_sdf_from_metadata(obj: dict[str, Any]) -> str | None:
 
 
 def get_reference_center_from_metadata(obj: dict[str, Any]) -> torch.Tensor | None:
-    """Extract reference center vector from ETFlowAlign output metadata."""
+    """ETFlowAlign 출력 메타데이터에서 레퍼런스 중심 벡터를 추출한다."""
     metadata = obj.get("metadata", {})
     if not isinstance(metadata, dict):
         return None
@@ -162,7 +162,7 @@ def write_candidate_sdfs(
     top_k: int | None = None,
     write_multisdf: bool = True,
 ) -> list[Path]:
-    """Write candidate conformations to individual SDF files."""
+    """후보 컨포메이션을 개별 SDF 파일로 저장한다."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,5 +1,5 @@
 # etflowalign/scripts/prepare_diffalign_example_batch.py
-"""Create an ETFlowAlign .pt inference batch from the bundled DiffAlign example.
+"""번들된 DiffAlign 예제에서 ETFlowAlign .pt 추론 배치를 생성한다.
 
 Example:
     python -m etflowalign.scripts.prepare_diffalign_example_batch \

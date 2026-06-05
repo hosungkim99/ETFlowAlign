@@ -1,4 +1,4 @@
-"""Pocket-aware guidance utilities with strict batch-safe interface checks."""
+"""배치 안전 인터페이스 검사를 갖춘 포켓 인식 가이던스 유틸리티."""
 
 from __future__ import annotations
 
@@ -15,20 +15,20 @@ UFFEnergyFn = Callable[[Tensor, AlignmentBatch, "UFFGuidanceConfig"], Tensor]
 
 @dataclass
 class UFFGuidanceConfig:
-    """Guidance hyperparameters."""
+    """가이던스 하이퍼파라미터."""
 
     scale: float = 1.0
 
 
 class UFFPocketGuidance:
-    """Simple differentiable guidance that avoids cross-graph coupling."""
+    """그래프 간 결합을 방지하는 간단한 미분 가능 가이던스."""
 
     def __init__(self, config: Optional[UFFGuidanceConfig] = None, backend_energy_fn: Optional[UFFEnergyFn] = None) -> None:
         self.config = config or UFFGuidanceConfig()
         self._backend_energy_fn = backend_energy_fn
 
     def energy(self, x: Tensor, batch: AlignmentBatch) -> Tensor:
-        """Compute per-graph additive energy."""
+        """그래프별 가산 에너지를 계산한다."""
         if self._backend_energy_fn is not None:
             out = self._backend_energy_fn(x, batch, self.config)
             if not torch.is_tensor(out):
@@ -47,7 +47,7 @@ class UFFPocketGuidance:
         return total_energy
 
     def __call__(self, batch: AlignmentBatch, t_graph: Tensor, v: Tensor) -> Tensor:
-        """Return guidance tensor with exact shape `[Nq, 3]`."""
+        """정확히 `[Nq, 3]` 형상의 가이던스 텐서를 반환한다."""
         del t_graph
         x = batch.query_pos.detach().clone().requires_grad_(True)
         grad = torch.autograd.grad(self.energy(x=x, batch=batch), x, create_graph=False, retain_graph=False)[0]

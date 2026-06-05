@@ -1,9 +1,9 @@
 # etflowalign/diffalign_adapter.py
-"""Adapters from DiffAlign-style molecular inputs to ETFlowAlign .pt payloads.
+"""DiffAlign 스타일 분자 입력에서 ETFlowAlign .pt 페이로드로의 어댑터.
 
-This module intentionally keeps the dependency boundary simple:
-- DiffAlign uses RDKit Mol -> PyG Data/Batch via mol_to_graph_data_obj.
-- ETFlowAlign uses plain tensor payloads loadable by etflowalign.data.
+이 모듈은 의존성 경계를 단순하게 유지한다:
+- DiffAlign은 mol_to_graph_data_obj를 통해 RDKit Mol -> PyG Data/Batch를 사용한다.
+- ETFlowAlign은 etflowalign.data로 로드 가능한 순수 텐서 페이로드를 사용한다.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from torch_geometric.data import Batch
 from torch_geometric.data import Data
 
 def load_rdkit_mol(path: str | Path, *, sanitize: bool = True, remove_hs: bool = True) -> Chem.Mol:
-    """Load RDKit molecule from SDF/MOL/PDB based on file extension."""
+    """파일 확장자에 따라 SDF/MOL/PDB에서 RDKit 분자를 로드한다."""
     path = Path(path)
     suffix = path.suffix.lower()
 
@@ -41,7 +41,7 @@ def load_rdkit_mol(path: str | Path, *, sanitize: bool = True, remove_hs: bool =
 
 
 def rdkit_mol_to_pos(mol: Chem.Mol) -> Tensor:
-    """Convert RDKit conformer coordinates to Tensor[N,3]."""
+    """RDKit 컨포머 좌표를 Tensor[N,3]으로 변환한다."""
     conf = mol.GetConformer()
     coords = []
 
@@ -52,9 +52,9 @@ def rdkit_mol_to_pos(mol: Chem.Mol) -> Tensor:
     return torch.tensor(coords, dtype=torch.float32)
 
 def mol_to_node_attr_local(mol: Chem.Mol) -> Tensor:
-    """Build minimal RDKit atom features for ETFlowAlign node conditioning.
+    """ETFlowAlign 노드 컨디셔닝을 위한 최소한의 RDKit 원자 특성을 구성한다.
 
-    Feature order:
+    특성 순서:
         [atomic_number, atom_degree, formal_charge, is_aromatic, is_in_ring]
     """
     features = []
@@ -86,13 +86,13 @@ def _bond_type_to_int(bond: Chem.Bond) -> int:
     raise ValueError(f"Unsupported bond type: {bond_type}")
 
 def mol_to_graph_data_obj_local(mol: Chem.Mol) -> Data:
-    """Local copy of DiffAlign's RDKit Mol -> PyG Data conversion.
+    """DiffAlign의 RDKit Mol -> PyG Data 변환의 로컬 복사본.
 
-    Output fields:
-        atom_type: Tensor[N], atomic number
-        edge_index: Tensor[2, 2E], directed bond edges
-        edge_type: Tensor[2E], bond type as float
-        pos: Tensor[N, 3], conformer coordinates
+    출력 필드:
+        atom_type: Tensor[N], 원자 번호
+        edge_index: Tensor[2, 2E], 방향 있는 결합 엣지
+        edge_type: Tensor[2E], float 형태의 결합 타입
+        pos: Tensor[N, 3], 컨포머 좌표
     """
     atom_features = []
     for atom in mol.GetAtoms():
@@ -137,11 +137,11 @@ def mol_to_graph_data_obj_local(mol: Chem.Mol) -> Data:
     )
     
 def mol_to_bond_index_and_length_local(mol: Chem.Mol, pos: Tensor) -> tuple[Tensor, Tensor]:
-    """Build undirected query bond index and target bond lengths.
+    """비방향 쿼리 결합 인덱스와 목표 결합 길이를 구성한다.
 
     Returns:
-        bond_index: LongTensor[2, E], one undirected edge per RDKit bond.
-        bond_length: FloatTensor[E], conformer bond length for each bond.
+        bond_index: LongTensor[2, E], RDKit 결합당 하나의 비방향 엣지.
+        bond_length: FloatTensor[E], 각 결합의 컨포머 결합 길이.
     """
     edges = []
     lengths = []

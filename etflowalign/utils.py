@@ -1,6 +1,6 @@
-"""Small shared helpers for ETFlowAlign.
+"""ETFlowAlign 공용 소형 헬퍼 모음.
 
-Keep this module lightweight; do not move core algorithmic logic here.
+이 모듈은 경량으로 유지한다. 핵심 알고리즘 로직은 여기에 두지 않는다.
 """
 
 from __future__ import annotations
@@ -10,12 +10,12 @@ from torch import Tensor
 
 
 def safe_norm(x: Tensor, dim: int = -1, keepdim: bool = False, eps: float = 1e-8) -> Tensor:
-    """Numerically stable vector norm."""
+    """수치적으로 안정적인 벡터 노름."""
     return torch.sqrt((x * x).sum(dim=dim, keepdim=keepdim).clamp_min(eps))
 
 
 def segment_mean(x: Tensor, batch: Tensor, num_graphs: int | None = None) -> Tensor:
-    """Compute per-graph mean tensor."""
+    """그래프별 평균 텐서를 계산한다."""
     if num_graphs is None:
         num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
     out = torch.zeros(num_graphs, x.size(-1), device=x.device, dtype=x.dtype)
@@ -26,14 +26,14 @@ def segment_mean(x: Tensor, batch: Tensor, num_graphs: int | None = None) -> Ten
 
 
 def center_by_batch(x: Tensor, batch: Tensor) -> Tensor:
-    """Subtract per-graph mean coordinates.
+    """그래프별 평균 좌표를 뺀다.
 
     Args:
-        x: Coordinate/feature tensor ``[N, D]``.
-        batch: Graph id per row ``[N]``.
+        x: 좌표/피처 텐서 ``[N, D]``.
+        batch: 행별 그래프 ID ``[N]``.
 
     Returns:
-        Centered tensor with per-graph mean removed.
+        그래프별 평균이 제거된 중심화된 텐서.
     """
     num_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
     if num_graphs == 0:

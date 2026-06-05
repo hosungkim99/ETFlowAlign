@@ -1,17 +1,17 @@
 # etflowalign/scripts/prepare_pdbbind_dataset.py
-"""Build an ETFlowAlign pocket-conditioned dataset from PDBbind refined.
+"""PDBbind refined에서 ETFlowAlign 포켓 조건부 데이터셋을 구축한다.
 
-Each PDBbind complex dir ``<id>/`` provides ``<id>_ligand.sdf`` (bound pose) and
-``<id>_pocket.pdb`` (binding-site atoms). For each complex we emit one per-complex
-``.pt`` payload (same schema as diffalign_adapter), pocket-conditioned:
+각 PDBbind 복합체 디렉터리 ``<id>/``에는 ``<id>_ligand.sdf`` (결합 포즈)와
+``<id>_pocket.pdb`` (결합 부위 원자)가 포함된다. 각 복합체에 대해
+포켓 조건부로 복합체별 ``.pt`` 페이로드(diffalign_adapter와 동일한 스키마)를 생성한다:
 
-    target_query_pos = ligand bound conformer - pocket_center
-    query_pos        = random rigid transform of target  (direction A source)
-    pocket_pos       = pocket atoms - pocket_center
-    reference_*      = absent  (pocket conditioning)
+    target_query_pos = 리간드 결합 컨포머 - pocket_center
+    query_pos        = 타겟의 무작위 강체 변환 (direction A 소스)
+    pocket_pos       = 포켓 원자 - pocket_center
+    reference_*      = 없음 (포켓 조건부)
 
-Failures (unreadable ligand, etc.) are skipped and logged; a manifest.csv lists
-the successful complexes for AlignmentDataset / train_val_split.
+실패 사례(리간드 읽기 불가 등)는 건너뛰고 로그에 기록되며,
+manifest.csv에는 AlignmentDataset / train_val_split에 사용할 성공한 복합체 목록이 저장된다.
 
 Example:
     python -m etflowalign.scripts.prepare_pdbbind_dataset \
@@ -53,7 +53,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def find_complexes(root: str) -> list[tuple[str, str]]:
-    """Return (pdb_id, complex_dir) for every ``*_pocket.pdb`` found under root."""
+    """root 하위에서 발견된 모든 ``*_pocket.pdb``에 대해 (pdb_id, complex_dir)를 반환한다."""
     out = []
     for pocket in sorted(glob.glob(os.path.join(root, "**", "*_pocket.pdb"), recursive=True)):
         cdir = os.path.dirname(pocket)
@@ -63,7 +63,7 @@ def find_complexes(root: str) -> list[tuple[str, str]]:
 
 
 def load_ligand(complex_dir: str, pdb_id: str) -> Chem.Mol:
-    """Load the bound ligand, trying SDF (sanitized, then unsanitized), then MOL2."""
+    """결합 리간드를 로드한다. SDF(정제됨, 이후 비정제됨), 그 다음 MOL2 순으로 시도한다."""
     sdf = os.path.join(complex_dir, f"{pdb_id}_ligand.sdf")
     mol2 = os.path.join(complex_dir, f"{pdb_id}_ligand.mol2")
 
@@ -84,9 +84,9 @@ def load_ligand(complex_dir: str, pdb_id: str) -> Chem.Mol:
 
 
 def parse_pocket_coords(pdb_path: str, drop_h: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """Parse heavy-atom coordinates + atomic numbers from a pocket PDB (sanitization-free).
+    """포켓 PDB에서 중원자 좌표와 원자 번호를 파싱한다 (정제 과정 없음).
 
-    Returns (coords[Np,3] float, atom_type[Np] long atomic numbers).
+    반환값: (coords[Np,3] float, atom_type[Np] long atomic numbers).
     """
     periodic = Chem.GetPeriodicTable()
     coords: list[list[float]] = []
@@ -188,7 +188,7 @@ def main() -> None:
                     "n_pocket": int(payload["pocket_pos"].size(0)),
                 })
                 n_ok += 1
-            except Exception as exc:  # noqa: BLE001 - dataset prep must be robust to bad complexes
+            except Exception as exc:  # noqa: BLE001 - 데이터셋 전처리는 불량 복합체에 강건해야 함
                 n_fail += 1
                 flog.write(f"{pdb_id}\t{exc}\n{traceback.format_exc()}\n")
             if (i + 1) % 200 == 0:

@@ -1,4 +1,4 @@
-"""Inference script and APIs for ETFlowAlign."""
+"""ETFlowAlign 추론 스크립트 및 API."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def generate_candidates(
     guidance_fn: Optional[GuidanceFn] = None,
     num_samples: int = 8,
 ) -> Tensor:
-    """Generate aligned candidates with strict interface checks."""
+    """엄격한 인터페이스 검사를 통해 정렬된 후보를 생성한다."""
     validate_alignment_batch(batch)
     outputs: list[Tensor] = []
     for _ in range(num_samples):
@@ -44,7 +44,7 @@ def rank_candidates(
     batch: AlignmentBatch,
     rank_fn: Optional[RankFn] = None,
 ) -> tuple[Tensor, Tensor]:
-    """Rank candidates with v0.1 one-complex-per-call validation."""
+    """v0.1 호출당 단일 복합체 유효성 검사를 통해 후보를 랭킹한다."""
     num_graphs = int(batch.query_batch.max().item()) + 1 if batch.query_batch.numel() else 0
     if num_graphs != 1:
         raise ValueError("v0.1 ranking supports exactly one complex per inference call.")
@@ -58,7 +58,7 @@ def rank_candidates(
 
 
 def run_inference(args: argparse.Namespace) -> None:
-    """CLI inference entrypoint."""
+    """CLI 추론 진입점."""
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
 
@@ -126,7 +126,7 @@ def run_inference(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Define inference CLI."""
+    """추론 CLI를 정의한다."""
     p = argparse.ArgumentParser(description="Run ETFlowAlign inference.")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--device", type=str, default="cpu")

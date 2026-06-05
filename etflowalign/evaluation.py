@@ -1,7 +1,7 @@
-"""Shared pose-RMSD evaluation, used by the eval script and by in-training monitoring.
+"""평가 스크립트와 학습 중 모니터링에서 공용으로 사용하는 포즈-RMSD 평가 모듈.
 
-Given a model and a list of per-complex ``.pt`` paths, sample a pose from each stored
-source and measure atomwise RMSD to the target (same frame, known correspondence).
+모델과 복합체별 ``.pt`` 경로 목록을 받아, 저장된 소스 각각에서 포즈를 샘플링하고
+타겟과의 원자 단위 RMSD를 측정한다(동일 프레임, 대응 관계가 알려진 경우).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ def _rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def summarize(rows: list[dict]) -> dict:
-    """Aggregate per-complex rows into summary statistics."""
+    """복합체별 행을 집계하여 요약 통계를 반환한다."""
     if not rows:
         return {"n": 0}
     pred = [r["pred_rmsd"] for r in rows]
@@ -59,10 +59,10 @@ def evaluate_paths(
     device: str | torch.device = "cpu",
     limit: int = 0,
 ) -> tuple[dict, list[dict]]:
-    """Run pose sampling on each complex and return (summary, per-complex rows).
+    """각 복합체에 대해 포즈 샘플링을 실행하고 (요약, 복합체별 행) 쌍을 반환한다.
 
-    The caller is responsible for the model's train/eval mode; sampling itself runs
-    under ``no_grad``.
+    모델의 학습/평가 모드 전환은 호출자가 책임진다. 샘플링 자체는
+    ``no_grad`` 컨텍스트에서 실행된다.
     """
     if limit and limit > 0:
         paths = paths[:limit]
@@ -72,7 +72,7 @@ def evaluate_paths(
     for path in paths:
         try:
             batch, target, meta = load_alignment_batch_from_pt(path, require_target=True, device=device)
-        except Exception:  # noqa: BLE001 - evaluation must skip unreadable complexes
+        except Exception:  # noqa: BLE001 - 읽을 수 없는 복합체는 평가에서 건너뜀
             continue
         batch = apply_conditioning(batch, conditioning)
         x0 = batch.query_pos

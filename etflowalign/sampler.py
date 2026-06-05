@@ -1,4 +1,4 @@
-"""ODE sampling for ETFlowAlign with safe guidance injection policies."""
+"""안전한 가이던스 주입 정책을 갖춘 ETFlowAlign용 ODE 샘플러."""
 
 from __future__ import annotations
 
@@ -15,19 +15,19 @@ GuidanceFn = Callable[[AlignmentBatch, Tensor, Tensor], Tensor]
 
 @dataclass
 class ODESamplerConfig:
-    """Configuration for ODE inference.
+    """ODE 추론을 위한 설정.
 
     Attributes:
-        n_steps: Number of integration steps from t_start to t_end.
-        t_start: Initial integration time.
-        t_end: Final integration time.
-        solver: Numerical solver (Euler or Heun).
-        guidance_scale: Global multiplier for external guidance.
-        guidance_mode: How guidance is injected.
-        max_guidance_norm: Per-atom norm cap for guidance vectors.
-        pc_corrector_step_scale: Step scale for predictor-corrector correction.
-        adaptive_dt: Enable simple adaptive step scaling by velocity norm.
-        adaptive_dt_max_scale: Maximum multiplier for adaptive dt.
+        n_steps: t_start에서 t_end까지의 적분 스텝 수.
+        t_start: 적분 초기 시간.
+        t_end: 적분 최종 시간.
+        solver: 수치 적분 기법 (Euler 또는 Heun).
+        guidance_scale: 외부 가이던스에 적용하는 전역 배율.
+        guidance_mode: 가이던스를 주입하는 방식.
+        max_guidance_norm: 가이던스 벡터에 적용되는 원자당 노름 상한.
+        pc_corrector_step_scale: predictor-corrector 보정의 스텝 배율.
+        adaptive_dt: 속도 노름 기반의 단순 적응형 스텝 배율 활성화.
+        adaptive_dt_max_scale: 적응형 dt의 최대 배율.
     """
 
     n_steps: int = 50
@@ -46,11 +46,11 @@ class ODESamplerConfig:
 
 
 class ETFlowAlignSampler:
-    """ODE sampler for alignment flow matching.
+    """정렬 플로우 매칭을 위한 ODE 샘플러.
 
-    Guidance mode:
-        - vector_field: add guidance directly to velocity before state update.
-        - predictor_corrector: apply guidance as a separate correction step.
+    가이던스 모드:
+        - vector_field: 상태 업데이트 전에 가이던스를 속도에 직접 더한다.
+        - predictor_corrector: 가이던스를 별도의 보정 스텝으로 적용한다.
     """
 
     def __init__(self, model: ETFlowAlignModel, config: ODESamplerConfig) -> None:
@@ -107,7 +107,7 @@ class ETFlowAlignSampler:
         if self.config.guidance_mode == "vector_field":
             return x, v + self.config.guidance_scale * g
 
-        # predictor-corrector: explicit x-state correction scaled by actual dt.
+        # predictor-corrector: 실제 dt로 스케일된 x 상태의 명시적 보정.
         if dt is None:
             raise ValueError("predictor_corrector guidance requires dt.")
         x_corrected = x + self.config.pc_corrector_step_scale * self.config.guidance_scale * dt * g
@@ -136,7 +136,7 @@ class ETFlowAlignSampler:
                 t_next = torch.full((num_graphs,), float(t_grid[i + 1]), device=x.device)
 
                 if self.config.guidance_mode == "predictor_corrector" and guidance_fn is not None and self.config.guidance_scale > 0.0:
-                    # (a) predictor_corrector mode: explicitly apply corrected predictor state.
+                    # (a) predictor_corrector 모드: 보정된 predictor 상태를 명시적으로 적용한다.
                     v_pred = self._model_v(batch, x_pred, t_next)
                     x_pred, _ = self._apply_guidance(batch, x_pred, t_next, v_pred, guidance_fn, dt=dt)
 

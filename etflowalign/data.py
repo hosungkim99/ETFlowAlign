@@ -1,4 +1,4 @@
-"""I/O helpers for loading ETFlowAlign batches from .pt files."""
+""".pt 파일에서 ETFlowAlign 배치를 불러오는 I/O 헬퍼 모음."""
 from __future__ import annotations
 
 from typing import Any
