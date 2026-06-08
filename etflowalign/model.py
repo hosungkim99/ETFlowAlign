@@ -818,7 +818,15 @@ class ETFlowAlignModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, self._n_rigid_bases),
             )
-            
+            # 안정화(zero-init): 출력층 가중치/바이어스를 0으로 초기화해 초기 속도장을 0으로
+            # 만든다. rigid head는 v = omega x rel + vlin 의 교차곱으로 속도를 만들어 omega
+            # 계수가 크면 속도가 폭발(거대 손실/NaN)한다. 0에서 시작하면 모델이 속도를
+            # 점진적으로 키우며 학습해 초기 발산을 막는다(diffusion/flow-matching의 zero-module 기법).
+            nn.init.zeros_(self.out_rigid_omega[-1].weight)
+            nn.init.zeros_(self.out_rigid_omega[-1].bias)
+            nn.init.zeros_(self.out_rigid_vlin[-1].weight)
+            nn.init.zeros_(self.out_rigid_vlin[-1].bias)
+
     def _reference_context(self, batch: AlignmentBatch) -> tuple[Tensor, Tensor]:
         """쿼리 원자로부터 레퍼런스 중심까지의 방향과 거리를 반환한다.
 
