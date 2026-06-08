@@ -1161,6 +1161,14 @@ class ETFlowAlignModel(nn.Module):
         omega = _segment_mean(omega_atom, batch.query_batch, num_graphs)  # [G, 3]
         vlin = _segment_mean(vlin_atom, batch.query_batch, num_graphs)  # [G, 3]
 
+        # 안정화: omega(회전율) 크기를 물리적 상한(소스->타겟 회전각 <= pi)으로 부드럽게
+        # 제한한다. v = omega x rel 교차곱은 omega가 커지면 속도를 폭발(trillions)시키는데,
+        # 타깃 omega는 Kabsch 회전각이라 항상 <= pi이므로 예측도 pi로 캡해도 표현력 손실이
+        # 없다. tanh로 norm을 [0, pi)에 매핑하며, omega가 작을 때는 거의 항등(scale~1)이다.
+        max_omega = 3.141592653589793
+        omega_norm = omega.norm(dim=-1, keepdim=True)
+        omega = omega * (max_omega * torch.tanh(omega_norm / max_omega) / omega_norm.clamp_min(1e-8))
+
         com = _segment_mean(x_in, batch.query_batch, num_graphs)  # [G, 3]
         rel = x_in - com[batch.query_batch]  # [N, 3]
         omega_i = omega[batch.query_batch]  # [N, 3]
