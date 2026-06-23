@@ -205,3 +205,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- 대용량/임시 산출물: 코드·문서만 git 추적 ---
+*.pyc
+# 실험 산출물 (체크포인트/구조/이미지/로그)
+etflowalign/smoke_tests/**/*.pt
+etflowalign/smoke_tests/**/*.sdf
+etflowalign/smoke_tests/**/*.png
+etflowalign/smoke_tests/**/*.log
+# unnecessary 폴더의 비-코드 산출물
+etflowalign/scripts/unnecessary/*.pt
+etflowalign/scripts/unnecessary/*.out
+etflowalign/scripts/unnecessary/*.err
+# slurm 로그
+slurm-*.out
+slurm-*.err

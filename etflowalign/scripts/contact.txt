@@ -1,0 +1,124 @@
+1. batch bond geometry 코드
+python - <<'PY'
+import torch
+import numpy as np
+from rdkit import Chem
+from pathlib import Path
+
+QUERY_SDF = "/gpfs/deepfold/users/hosung/work/ETFlowAlign/external/diffalign/diffalign/example/query.sdf"
+
+TRAIN_PT = "/home/deepfold/users/hosung/work/ETFlowAlign/etflowalign/smoke_tests/00_inputs/diffalign_example_rigid_source/diffalign_example_train.pt"
+INFER_PT = "/home/deepfold/users/hosung/work/ETFlowAlign/etflowalign/smoke_tests/00_inputs/diffalign_example_rigid_source/diffalign_example_infer.pt"
+
+
+def load_query_sdf(path):
+    mol = Chem.SDMolSupplier(path, removeHs=False, sanitize=False)[0]
+    if mol is None:
+        raise RuntimeError(f"Failed to load query SDF: {path}")
+
+    conf = mol.GetConformer()
+    xyz = []
+    for i in range(mol.GetNumAtoms()):
+        p = conf.GetAtomPosition(i)
+        xyz.append([p.x, p.y, p.z])
+
+    bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
+    return mol, np.asarray(xyz, dtype=float), bonds
+
+
+def bond_stats(xyz, bonds):
+    vals = np.asarray(
+        [np.linalg.norm(xyz[i] - xyz[j]) for i, j in bonds],
+        dtype=float,
+    )
+    return vals.min(), vals.mean(), vals.max()
+
+
+def maybe_restore_to_global(xyz, payload):
+    center = payload.get("reference_center_subtracted")
+    if center is None:
+        return xyz
+
+    if torch.is_tensor(center):
+        center = center.cpu().numpy()
+    else:
+        center = np.asarray(center, dtype=float)
+
+    return xyz + center.reshape(1, 3)
+
+
+def report_payload(name, path, query_xyz, bonds):
+    path = Path(path)
+    print(f"\n=== {name} ===")
+    print("path:", path)
+
+    if not path.exists():
+        print("MISSING")
+        return
+
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+
+    print("source:", obj.get("source"))
+    print("randomize_query_pos:", obj.get("randomize_query_pos"))
+    print("query_source:", obj.get("query_source"))
+    print("seed:", obj.get("seed"))
+
+    for key in ["query_pos", "target_query_pos"]:
+        if key not in obj:
+            print(f"\n{key}: MISSING")
+            continue
+
+        x = obj[key]
+        if not torch.is_tensor(x):
+            print(f"\n{key}: not tensor, type={type(x)}")
+            continue
+
+        xyz_centered = x.cpu().numpy()
+        xyz_global = maybe_restore_to_global(xyz_centered, obj)
+
+        centered_bond = bond_stats(xyz_centered, bonds)
+        global_bond = bond_stats(xyz_global, bonds)
+
+        rmsd_to_query = np.sqrt(((xyz_global - query_xyz) ** 2).sum(axis=1).mean())
+        com_dist = np.linalg.norm(xyz_global.mean(axis=0) - query_xyz.mean(axis=0))
+
+        print(f"\n{key}: {tuple(x.shape)}")
+        print("  centered bond min/mean/max:", centered_bond)
+        print("  global   bond min/mean/max:", global_bond)
+        print("  global RMSD to query_sdf:", rmsd_to_query)
+        print("  global COM dist:", com_dist)
+
+    if "query_pos" in obj and "target_query_pos" in obj:
+        q = obj["query_pos"]
+        t = obj["target_query_pos"]
+        source_target_rmsd = torch.sqrt(((q - t) ** 2).sum(dim=-1).mean()).item()
+        print("\nsource_target_rmsd_centered:", source_target_rmsd)
+
+
+mol, query_xyz, bonds = load_query_sdf(QUERY_SDF)
+
+print("=== query_sdf ===")
+print("atoms:", mol.GetNumAtoms())
+print("bonds:", mol.GetNumBonds())
+print("bond min/mean/max:", bond_stats(query_xyz, bonds))
+
+report_payload("TRAIN_PT", TRAIN_PT, query_xyz, bonds)
+report_payload("INFER_PT", INFER_PT, query_xyz, bonds)
+PY
+
+2. 학습 후, checkpoint metadata 확인
+python - <<'PY'
+import torch
+
+path = "/home/deepfold/users/hosung/work/ETFlowAlign/etflowalign/smoke_tests/05_rigid_source_nodeattr/checkpoints/etflowalign_basis_nodeattr_rigid_randomt_3k_best.pt"
+
+ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+print("model_args:", ckpt["model_args"])
+print("flow_args:", ckpt["flow_args"])
+print("best_loss:", ckpt.get("best_loss"))
+print("best_step:", ckpt.get("best_step"))
+print("final_loss:", ckpt.get("final_loss"))
+PY
+
+3. diagnostic 

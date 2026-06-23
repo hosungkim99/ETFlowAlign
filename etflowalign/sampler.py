@@ -70,6 +70,10 @@ class ETFlowAlignSampler:
             reference_atom_type=batch.reference_atom_type,
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
+            pocket_batch=batch.pocket_batch,
+            pocket_atom_type=batch.pocket_atom_type,
+            query_node_attr=batch.query_node_attr,
+            reference_node_attr=batch.reference_node_attr,
         )
         return self.model(cur, t_graph=t_graph)
 
@@ -93,6 +97,10 @@ class ETFlowAlignSampler:
             reference_atom_type=batch.reference_atom_type,
             reference_batch=batch.reference_batch,
             pocket_pos=batch.pocket_pos,
+            pocket_batch=batch.pocket_batch,
+            pocket_atom_type=batch.pocket_atom_type,
+            query_node_attr=batch.query_node_attr,
+            reference_node_attr=batch.reference_node_attr,
         )
         g = self._clip_guidance(guidance_fn(cur, t_graph, v))
 
@@ -117,6 +125,8 @@ class ETFlowAlignSampler:
             t_graph = torch.full((num_graphs,), float(t), device=x.device)
 
             v = self._model_v(batch, x, t_graph)
+            if not torch.isfinite(v).all():
+                raise FloatingPointError(f"Non-finite velocity at step={i}, t={float(t):.6f}.")
             x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn, dt=dt)
 
             if self.config.solver == "euler":
@@ -131,6 +141,11 @@ class ETFlowAlignSampler:
                     x_pred, _ = self._apply_guidance(batch, x_pred, t_next, v_pred, guidance_fn, dt=dt)
 
                 v_next = self._model_v(batch, x_pred, t_next)
+                if not torch.isfinite(v_next).all():
+                    raise FloatingPointError(
+                    f"Non-finite coordinates during ODE integration at step={i}, t={float(t):.6f}. "
+                    "Check velocity scale, solver step size, batch fields, or model rollout stability."
+                )
                 _, v_next = self._apply_guidance(batch, x_pred, t_next, v_next, guidance_fn, dt=dt)
                 x = x + 0.5 * dt * (v + v_next)
 
