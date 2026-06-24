@@ -142,6 +142,9 @@ def run_training(args: argparse.Namespace) -> None:
         "use_pocket_conditioning": args.use_pocket_conditioning,
         "pocket_cutoff": args.pocket_cutoff,
         "pocket_max_neighbors": args.pocket_max_neighbors,
+        "use_reference_conditioning": args.use_reference_conditioning,
+        "reference_cutoff": args.reference_cutoff,
+        "reference_max_neighbors": args.reference_max_neighbors,
         "use_node_attr": args.use_node_attr,
         "node_attr_dim": args.node_attr_dim,
         "max_atoms": args.max_atoms,
@@ -301,6 +304,7 @@ def run_training(args: argparse.Namespace) -> None:
                     solver=args.val_eval_solver,
                     device=device,
                     limit=args.val_eval_limit,
+                    flow_config=matcher.config,  # x0를 학습 source 분포에서 시작(일관성)
                 )
                 print(f"[val]   step={step:04d} {format_summary(val_summary)}")
             except Exception as exc:  # noqa: BLE001 - val monitoring must never kill training
@@ -373,6 +377,14 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--pocket-cutoff", type=float, default=8.0, help="Ligand-pocket edge cutoff (A).")
     p.add_argument("--pocket-max-neighbors", type=int, default=16, help="Max pocket neighbors per ligand atom.")
+    p.add_argument(
+        "--use-reference-conditioning",
+        action="store_true",
+        help="Feed reference atoms into the model (query<->reference messages + reference-shape basis). "
+             "DiffAlign-faithful reference shape conditioning.",
+    )
+    p.add_argument("--reference-cutoff", type=float, default=8.0, help="Query-reference edge cutoff (A).")
+    p.add_argument("--reference-max-neighbors", type=int, default=16, help="Max reference neighbors per query atom.")
     p.add_argument(
         "--path-type",
         type=str,

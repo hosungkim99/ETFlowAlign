@@ -205,6 +205,13 @@ class PocketInteraction(nn.Module):
         vec.index_add_(0, lig_idx, gate * rij)     # |contribution| <= cutoff
         return self.norm(h_update / deg), vec / deg
 
+
+# reference 형상 조건화: query↔reference cross-interaction은 PocketInteraction과 동일 구조
+# (고정 외부 점군에 대한 메시지 패싱 → 불변 피처 업데이트 + 등변 형상 벡터)이므로 그대로 재사용한다.
+# DiffAlign처럼 reference의 중심점이 아니라 형상(원자 분포)을 query가 감지하게 한다.
+ReferenceInteraction = PocketInteraction
+
+
 class EquivariantBlock(nn.Module):
     """Simple EGNN-style block: scalar message + relative vector aggregation."""
 
@@ -274,6 +281,9 @@ class ETFlowAlignModel(nn.Module):
         use_pocket_conditioning: bool = False,
         pocket_cutoff: float = 8.0,
         pocket_max_neighbors: int = 16,
+        use_reference_conditioning: bool = False,
+        reference_cutoff: float = 8.0,
+        reference_max_neighbors: int = 16,
         use_node_attr: bool = False,
         node_attr_dim: int = 5,
         max_atoms: int = 256,
@@ -295,6 +305,13 @@ class ETFlowAlignModel(nn.Module):
         if self.use_pocket_conditioning:
             self.pocket_interaction = PocketInteraction(hidden_dim)
 
+        # reference 형상 조건화(DiffAlign 충실): query↔reference 메시지 패싱으로 reference 형상을 감지
+        self.use_reference_conditioning = bool(use_reference_conditioning)
+        self.reference_cutoff = float(reference_cutoff)
+        self.reference_max_neighbors = int(reference_max_neighbors)
+        if self.use_reference_conditioning:
+            self.reference_interaction = ReferenceInteraction(hidden_dim)
+
         # rigid head gains a 5th basis (pocket-shape vector) when pocket conditioning is on
         self._n_rigid_bases = 5 if self.use_pocket_conditioning else 4
         
@@ -302,7 +319,10 @@ class ETFlowAlignModel(nn.Module):
             self.atom_index_embed = nn.Embedding(self.max_atoms, hidden_dim)
 
         self.time_embed = SimpleTimeEmbedding(time_embed_dim)
-        self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 4, hidden_dim)
+        # in_proj 입력 = 원자(hidden) + 시간(time) + reference 거리(1, 불변). 방향(ref_dir)은
+        # 회전하는 벡터라 스칼라 입력으로 넣으면 E(3)-등변성이 깨지므로 제외하고, 방향 정보는
+        # 등변 채널(reference_basis / _reference_delta_basis)로만 전달한다.
+        self.in_proj = nn.Linear(hidden_dim + time_embed_dim + 1, hidden_dim)
 
         self.blocks = nn.ModuleList([EquivariantBlock(hidden_dim) for _ in range(num_blocks)])
 
@@ -408,7 +428,14 @@ class ETFlowAlignModel(nn.Module):
             local_index[mask] = torch.arange(n, device=query_batch.device, dtype=query_batch.dtype)
         return local_index
 
-    def _equivariant_basis_head(self, h: Tensor, x: Tensor, batch: AlignmentBatch, edge_index: Tensor) -> Tensor:
+    def _equivariant_basis_head(
+        self,
+        h: Tensor,
+        x: Tensor,
+        batch: AlignmentBatch,
+        edge_index: Tensor,
+        reference_basis: Optional[Tensor] = None,
+    ) -> Tensor:
         """Predict velocity by combining equivariant vector bases.
 
         The scalar coefficients are invariant because they are predicted from scalar node
@@ -417,14 +444,16 @@ class ETFlowAlignModel(nn.Module):
 
         Bases:
             0. x: query-centered coordinate basis after equivariant blocks.
-            1. reference delta: reference center - query atom.
+            1. reference: shape-aware reference vector (cross message passing) if reference
+               conditioning is on, else the centroid delta (reference center - query atom).
             2. pocket delta: pocket center - query atom.
             3. neighbor aggregate: sum_j (x_j - x_i).
         """
         coeff = self.out_basis_coeff(h)  # [N, 4]
 
         basis_query = x  # equivariant block을 거친 query 좌표
-        basis_reference = self._reference_delta_basis(batch)
+        # reference 조건화가 켜져 있으면 형상-인지 벡터를, 아니면 중심점 델타를 사용
+        basis_reference = reference_basis if reference_basis is not None else self._reference_delta_basis(batch)
         basis_pocket = self._pocket_delta_basis(batch)
         basis_neighbor = self._neighbor_vector_basis(x, edge_index)
 
@@ -520,9 +549,9 @@ class ETFlowAlignModel(nn.Module):
             h_atom = h_atom + self.atom_index_embed(local_index)
 
         h_t = self.time_embed(t_graph)[batch.query_batch]
-        ref_dir, ref_dist = self._reference_context(batch)
+        _ref_dir, ref_dist = self._reference_context(batch)  # ref_dir은 등변성 위해 in_proj에 넣지 않음
 
-        h = self.in_proj(torch.cat([h_atom, h_t, ref_dir, ref_dist], dim=-1))
+        h = self.in_proj(torch.cat([h_atom, h_t, ref_dist], dim=-1))
 
         # Pocket-shape conditioning: enrich ligand features and build a directional
         # pocket-shape basis from the fixed binding-site atoms (in the ligand-COM frame).
@@ -544,7 +573,29 @@ class ETFlowAlignModel(nn.Module):
             )
             h_pocket, pocket_basis = self.pocket_interaction(h, x_in, xp, h_pkt, lig_idx, pkt_idx)
             h = h + h_pocket
-        
+
+        # Reference-shape conditioning (DiffAlign 충실): query 원자가 reference 리간드의 형상을
+        # (중심점이 아니라) cross 메시지 패싱으로 감지한다. reference_basis는 형상 방향 등변 벡터로
+        # basis head의 reference 기저를 중심점 대신 형상-인지 벡터로 대체한다.
+        reference_basis = None
+        if (
+            self.use_reference_conditioning
+            and batch.reference_pos is not None
+            and batch.reference_batch is not None
+            and batch.reference_batch.numel() > 0
+        ):
+            xr = batch.reference_pos - com[batch.reference_batch]
+            if batch.reference_atom_type is not None:
+                h_ref = self.atom_embed(batch.reference_atom_type)  # reference 화학(공유 원자 임베딩)
+            else:
+                h_ref = self.reference_interaction.fallback_token.unsqueeze(0).expand(xr.size(0), -1)
+            ref_lig_idx, ref_idx = build_cross_edges(
+                x_in, batch.query_batch, xr, batch.reference_batch,
+                self.reference_cutoff, self.reference_max_neighbors,
+            )
+            h_reference, reference_basis = self.reference_interaction(h, x_in, xr, h_ref, ref_lig_idx, ref_idx)
+            h = h + h_reference
+
         edge_index = build_radius_edges(x, batch.query_batch, self.edge_cutoff, self.max_neighbors)
 
         for block in self.blocks:
@@ -556,7 +607,7 @@ class ETFlowAlignModel(nn.Module):
 
         # production-호환 equivariant basis head
         if self.use_equivariant_basis_head:
-            return self._equivariant_basis_head(h, x, batch, edge_index)
+            return self._equivariant_basis_head(h, x, batch, edge_index, reference_basis)
 
         raise RuntimeError(
             "출력 head가 선택되지 않았습니다: use_rigid_head 또는 use_equivariant_basis_head 중 하나를 켜세요."

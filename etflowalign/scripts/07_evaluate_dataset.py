@@ -27,6 +27,7 @@ import torch
 
 from etflowalign.dataset import AlignmentDataset, train_val_split
 from etflowalign.evaluation import evaluate_paths
+from etflowalign.flow_matching import FlowMatchingConfig
 from etflowalign.model import ETFlowAlignModel
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -35,6 +36,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="", help="Directory of per-complex .pt payloads.")
     p.add_argument("--manifest", default="", help="Text file listing .pt paths (one per line).")
     p.add_argument("--conditioning", default="pocket", choices=["pocket", "reference", "both"])
+    p.add_argument("--source-type", default="input_query",
+                   choices=["gaussian", "reference_anchored", "query_perturbed", "input_query"],
+                   help="ODE start (x0) distribution. MUST match training. 'gaussian'=noise (DiffAlign flexible); "
+                        "'input_query'=stored query pose (legacy rigid eval).")
+    p.add_argument("--source-noise-scale", type=float, default=0.5)
     p.add_argument("--n-steps", type=int, default=50)
     p.add_argument("--solver", default="heun", choices=["euler", "heun"])
     p.add_argument("--device", default="cpu")
@@ -78,6 +84,9 @@ def main() -> None:
     paths = gather_paths(args)
     print(f"[eval] {len(paths)} complexes | split={args.split} solver={args.solver} n_steps={args.n_steps}")
 
+    flow_config = FlowMatchingConfig(
+        source_type=args.source_type, source_noise_scale=args.source_noise_scale
+    )
     summary, rows = evaluate_paths(
         model,
         paths,
@@ -86,6 +95,7 @@ def main() -> None:
         solver=args.solver,
         device=device,
         limit=0,  # gather_paths already applied --limit
+        flow_config=flow_config,
     )
     if summary.get("n", 0) == 0:
         print("[eval] no complexes evaluated.")

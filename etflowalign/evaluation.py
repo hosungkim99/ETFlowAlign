@@ -12,6 +12,7 @@ import torch
 
 from .data import load_alignment_batch_from_pt
 from .dataset import Conditioning, apply_conditioning
+from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig
 from .sampler import ETFlowAlignSampler, ODESamplerConfig
 
 
@@ -58,15 +59,22 @@ def evaluate_paths(
     solver: str = "heun",
     device: str | torch.device = "cpu",
     limit: int = 0,
+    flow_config: FlowMatchingConfig | None = None,
 ) -> tuple[dict, list[dict]]:
     """Run pose sampling on each complex and return (summary, per-complex rows).
 
     The caller is responsible for the model's train/eval mode; sampling itself runs
     under ``no_grad``.
+
+    ``flow_config`` controls how the ODE start state ``x0`` is drawn: it MUST match the
+    source distribution used in training (e.g. ``source_type='gaussian'`` for DiffAlign-style
+    flexible generation from noise). If ``None``, falls back to ``input_query`` (x0 = the
+    stored query pose), which reproduces the legacy rigid-source evaluation.
     """
     if limit and limit > 0:
         paths = paths[:limit]
     sampler = ETFlowAlignSampler(model, ODESamplerConfig(n_steps=n_steps, solver=solver))
+    matcher = AlignmentFlowMatcher(flow_config or FlowMatchingConfig(source_type="input_query"))
 
     rows: list[dict] = []
     for path in paths:
@@ -75,7 +83,9 @@ def evaluate_paths(
         except Exception:  # noqa: BLE001 - evaluation must skip unreadable complexes
             continue
         batch = apply_conditioning(batch, conditioning)
-        x0 = batch.query_pos
+        # x0를 학습과 동일한 source 분포에서 추출(예: gaussian 노이즈) — query_pos에서 시작하면
+        # flexible-from-noise 평가가 무의미해진다(정답에서 시작).
+        x0 = matcher.sample_source(batch, target_query_pos=target)
         pred = sampler.sample(batch=batch, x0=x0.clone())
 
         row = {
