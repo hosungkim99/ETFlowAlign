@@ -157,24 +157,41 @@
 
 
 ================================================================================
- PHASE 5 · overfit-100 (capacity 게이트)                             [~] 러너완료
+ PHASE 5 · overfit-100 (capacity 게이트)                             [~] 진단중(막힘)
 ================================================================================
-- 목표: 100개 정렬쌍을 "암기"시켜 모델 용량 확인 (일반화 전 필수 관문)
-- 게이트 B: median aligned RMSD < 2Å (과거 성공수치 raw 1.67 / aligned 1.29)
-- 상태: 서버 실학습 진행. 조건부 경로 어려움 확정, 게이트 B 미통과.
-  · non-force: median aligned 3.365, 8/100.
-  · force-align(오라클 회전제거 진단): 2.263, 32/100 (대폭 개선이나 여전히 FAIL).
-  · 결론: 회전 문제 확인 + 용량/수렴 한계 공존. 오라클조차 FAIL → 회전보정만으론 부족.
-  · 다음: --n 20 용량vs개수 분리 → 이후 [테스트가능 회전보정(ref프레임 정렬) + 용량↑].
-- ⚠️ 조건부 경로(source 정렬 OFF) — Gate A(비조건)가 검증 안 한 regime, 리스크 현실화.
+- 목표: 소수 정렬쌍을 "암기"시켜 모델 용량 확인 (일반화 전 필수 관문)
+- 게이트 B: median aligned RMSD < 2Å
+- 상태: 실분자 생성이 ~1.7~2.4Å에서 막힘. 원인을 한 겹씩 배제 중.
 
-[1] scripts/04_overfit100.py  (완료)
-    - 실.pt 100개 로드 -> collate(조건부) -> PrecomputedHarmonicSampler(eigh 1회)
-    - train_flow(조건부, EMA on, source정렬 off) -> 조건부 ODE 샘플
-    - median aligned/raw RMSD, aligned<2A 비율 리포트
-    - 판정: 못 외우면 조건부 경로 진단(백본/조건화/prior 배치)
-[2] flow/prior.py PrecomputedHarmonicSampler (완료) — 고유분해 캐시
-[3] train.py train_flow(prior=...) (완료) — 캐시 prior 주입
+[진단 여정 — 배제된 원인들]
+  · 회전:      force-align(오라클) → 3.365→2.263. 요인 맞으나 부족.
+  · 개수:      n=4/20/100 전부 ~2.2~2.5 → 무관.
+  · conditioning: unconditional → 2.056 → 조건부와 비슷 → 무관.
+  · 용량:      HIDDEN=512/LAYERS=12 → 2.305 → 개선 없음 → 무관.
+  · cutoff/크기: 크기 진단 작은2.35≈큰2.58 → 무관.
+  · 측정(H):   GEOM 데이터 H=0(heavy=all-atom) → 지표 부풀림 아님.
+  · 적분:      SAMPLE=500 → 2.393(100스텝 2.305와 동일) → 적분오차 아님.
+
+[★핵심 통찰] "Gate A 통과=엔진 작동"은 착시였음.
+  합성분자(랜덤트리+1.5Å결합) ≈ harmonic prior 분포 → transport trivial → 쉽게 통과.
+  실분자(링·정해진 각도)는 prior와 완전히 달라 transport 어려움 → 못 그림.
+  Acid test(단일 실분자 n=1): median 1.706. 분자 1개·간섭없음인데도 loss 요동(0.25~1.5)
+  → 모델이 harmonic→실분자 속도장을 정밀표현 못함이 병목.
+
+[남은 갈림길 — 미판정]
+  (a) 학습 분산:  B1(스텝당 다중 x0·t로 분산↓)으로 분자1개 loss가 ~0 가나?
+  (b) 모델 표현력: 안 가면 formulation(C1 GVP path / C2 prior) 또는 백본 재설계.
+  → 다음 실험: N=1 UNCOND MICRO=8 sbatch run_overfit.sh
+
+[구현된 진단 도구 — scripts/04_overfit100.py]
+    - 실.pt 로드 -> collate -> PrecomputedHarmonicSampler(eigh 1회 캐시)
+    - 미니배치(--batch-size, OOM 회피), train_flow(EMA)
+    - --force-align   : 오라클 회전제거(진단)
+    - --unconditional : reference 제거(진단)
+    - --micro K       : 스텝당 K개(x0,t) 평균 → 분산↓ (B1)
+    - --load CKPT     : eval-only(학습 생략, 샘플링만 — 샘플스텝/지표 재측정)
+    - 리포트: all-atom + heavy-atom RMSD, 원자조성(H비율), 크기별 진단, prior 기준선
+    - flow/prior.py PrecomputedHarmonicSampler, train.py FlowConfig.n_micro
 
 
 ================================================================================
@@ -216,26 +233,31 @@
  진행 순서 요약
 ================================================================================
  [x] Phase 0  설계 명세
- [x] Phase 3  등변 백본 (선행) + 등변성 게이트 통과
- [x] Phase 2  flow-matching 코어  -> 게이트 A PASS (aligned 0.694)
- [~] Phase 1  데이터 파이프라인   -> 코드완료+로컬왕복, 실빌드/육안게이트 서버 대기
- [x] Phase 4  reference 조건화    -> 등변성 재통과 + 학습/샘플 연결
- [~] Phase 5  overfit-100        -> 러너완료, 서버 실학습 대기  ★ 다음
- [x] Phase 1  실데이터 빌드      -> 65000 fail0, 데이터게이트 PASS(shapeT 0.558)
+ [x] Phase 3  등변 백본           -> 등변성 게이트 통과 (1e-15)
+ [x] Phase 4  reference 조건화    -> joint 등변 재통과 + 학습/샘플 연결
+ [x] Phase 1  데이터              -> 실데이터 65000 빌드, 육안게이트 PASS(shapeT 0.56)
+ [x] Phase 2  flow-matching 코어  -> 게이트 A PASS (합성 aligned 0.694)
+ [~] Phase 5  overfit-100        -> 실분자 ~2Å 정체, 진단중  ★ 현재 (B1 판정 대기)
  [ ] Phase 6  일반화             -> 게이트 C (val 개선)
  [ ] Phase 7  평가 + 포켓 가이던스 -> Top-1 RMSD
 
+ ※ 주의: Phase 2 Gate A(합성) 통과는 실분자 생성 검증이 아니었음(착시, Phase 5 참조).
+
 
 ================================================================================
- 로컬/서버 작업 분리 (2026-07-21 확정)
+ 로컬/서버 작업 분리
 ================================================================================
 - 로컬(노트북): 성능 낮고 소음 큼 -> "코드가 도는지"만 초소량 검증
     PYTHONPATH=. python -m etflowalign.tests.test_equivariance   # 등변성 게이트
     PYTHONPATH=. python -m etflowalign.tests.test_smoke_run      # 초소형 실행확인(수초)
-    * 절대 로컬에서 대규모 학습 돌리지 말 것.
-- 서버(A10): 실제 학습/게이트 판정
-    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python etflowalign/scripts/03_smoke_generate.py \
-        --prior harmonic --mols 4 --steps 8000 --device cuda
+    PYTHONPATH=. python -m etflowalign.tests.test_data_pairs     # 데이터 왕복
+    PYTHONPATH=. python -m etflowalign.tests.test_conditional_flow
+    * 절대 로컬에서 대규모 학습 돌리지 말 것. 코드는 파일 통째 복사로 서버 동기화.
+- 서버(A10): 실제 학습/게이트 판정 = ★SLURM(sbatch)만★ (로그인노드 직접실행 금지=감사대상)
+    N=1 UNCOND=--unconditional MICRO=8 sbatch --time=00:40:00 etflowalign/scripts/run_overfit.sh
+    · 확인: squeue --me   |   tail -40 $(ls -t etfa_of_*.log | head -1)
+    · 큐 붐비면 짧은 --time 으로 backfill 유도(짧은 job이 빈틈에 먼저 들어감)
+    · 상세: SERVER_RUN.md
 
 
 ================================================================================
@@ -280,15 +302,17 @@ etflowalign/
 ├── data/
 │   ├── __init__.py                 [x]
 │   └── pairs.py                    [x]
+├── SERVER_RUN.md                   [x] (SLURM 실행 가이드)
 ├── guidance.py                     [ ]
-├── sampler.py                      [x]
-├── train.py                        [x] (Phase 2 조건없음 버전)
+├── sampler.py                      [x] (조건부 + eval-only x0 주입)
+├── train.py                        [x] (조건부, EMA, source정렬, n_micro)
 ├── evaluation.py                   [ ]
 ├── scripts/
 │   ├── 01_build_aligned_pairs.py   [x]
 │   ├── 02_visualize_pairs.py       [x]
 │   ├── 03_smoke_generate.py        [x]
-│   ├── 04_overfit100.py            [x]
+│   ├── 04_overfit100.py            [x] (--force-align/--unconditional/--micro/--load)
+│   ├── run_overfit.sh              [x] (sbatch 러너: N/STEPS/HIDDEN/MICRO/UNCOND/LOAD env)
 │   ├── 05_train_full.py            [ ]
 │   ├── 06_diagnose_generalization.py [ ]
 │   └── 07_evaluate_disco.py        [ ]

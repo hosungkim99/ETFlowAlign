@@ -1,32 +1,27 @@
-# ETFlowAlign 서버 실행 가이드 (A10 x4, CUDA)
+# ETFlowAlign 서버 실행 가이드 (A10 x4, CUDA, SLURM)
 
-> 상단 **변수 3개만** 본인 환경에 맞게 채우면 아래 명령을 그대로 복붙 실행 가능.
-> 서버 파일은 본인 사용자 디렉터리 범위 안에서만 생성/수정할 것.
+> **원칙: 모든 compute 는 SLURM(sbatch)으로만.** 로그인 노드 직접 실행·srun 잡 금지(감사 대상).
+> 코드는 로컬에서 작성 → 서버로 **파일 통째 복사** 동기화(부분 편집 금지 — 유령버그 이력).
+> 서버 파일은 본인 사용자 디렉터리 범위 안에서만 생성/수정.
 
 ```bash
 # ── 채울 변수 ─────────────────────────────────────────────
-export CODE=/path/to/ETFlowAlign          # etflowalign/ 패키지의 부모 디렉터리
-export DATA=/path/to/GEOM-Drugs_AlignedPairs   # complex_*/{query,reference}.sdf 루트
-export GPU=1                                # 빈 GPU 번호 (nvidia-smi 로 확인, 0은 자주 점유)
-# ────────────────────────────────────────────────────────
+export CODE=/gpfs/deepfold/users/hosung/work/ETFlowAlign   # etflowalign/ 의 부모
 cd $CODE
 ```
 
-모든 명령은 `$CODE`(패키지 부모)에서 실행하며 `PYTHONPATH=.` 를 붙인다.
-스크립트 파일명이 숫자로 시작해 `-m` import 는 안 되므로 **파일 경로로 실행**한다.
-
 ---
 
-## 0) 환경 설치 (최초 1회)
+## 0) 환경 (최초 1회)
 
 ```bash
-# 서버 CUDA 에 맞는 torch 를 먼저 설치(예시 — 실제 CUDA 버전에 맞출 것)
-# pip install torch --index-url https://download.pytorch.org/whl/cu121
-pip install -r etflowalign/requirements.txt
-python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate etflowalign
+pip install -r etflowalign/requirements.txt        # torch 는 CUDA 맞는 빌드 먼저
+python -c "import torch; print('cuda', torch.cuda.is_available())"
 ```
 
-## 1) 설치 검증 — 로컬 4종 테스트를 서버에서 (수초, CPU 무방)
+## 1) 설치 검증 (수초, 로그인노드 CPU 무방 — 학습 아님)
 
 ```bash
 PYTHONPATH=. python -m etflowalign.tests.test_equivariance
@@ -36,43 +31,65 @@ PYTHONPATH=. python -m etflowalign.tests.test_conditional_flow
 ```
 → 모두 PASS 면 코드/의존성 정상.
 
-## 2) 게이트 A — GPU에서 엔진 학습+생성 (실데이터 불필요, 첫 GPU 실전)
-
-합성 분자로 harmonic prior + 8000스텝 학습 후 생성. **A10에서 엔진이 도는지 + 게이트 A 판정.**
+## 2) 데이터 (Phase 1 — 이미 65k 빌드 완료, 재빌드 시에만)
 
 ```bash
-CUDA_VISIBLE_DEVICES=$GPU PYTHONPATH=. PYTHONIOENCODING=utf-8 \
-  python etflowalign/scripts/03_smoke_generate.py \
-    --prior harmonic --mols 4 --steps 8000 --device cuda
+export DATA=/path/to/GEOM-Drugs_AlignedPairs       # complex_*/{query,reference}.sdf
+PYTHONPATH=. python etflowalign/scripts/01_build_aligned_pairs.py --root $DATA --out $CODE/geom_pt --limit 0
+PYTHONPATH=. python etflowalign/scripts/02_visualize_pairs.py     --root $DATA --out $CODE/vis --n 20
 ```
-→ 기대: `generated aligned RMSD` 가 baseline 보다 크게 낮고 결합거리 1.3~1.7A → `[GATE A] PASS`.
-   (안 넘으면 steps 를 늘리거나 로컬에서 진단 — 서버 시간 낭비 전 알려주세요.)
-
-## 3) Phase 1 — 실데이터 정렬쌍을 텐서(.pt)로 빌드
-
-```bash
-# 먼저 소수만 (--limit 50) 로 형식 확인
-PYTHONPATH=. python etflowalign/scripts/01_build_aligned_pairs.py \
-  --root $DATA --out $CODE/geom_pt --limit 50
-
-# 정렬 육안/통계 게이트 (SPEC §3.2)
-PYTHONPATH=. python etflowalign/scripts/02_visualize_pairs.py \
-  --root $DATA --out $CODE/vis --n 20
-# -> shape_overlap>0.5, centroid_dist 작음 이면 정렬 양호. vis/*.sdf 를 뷰어로 확인.
-
-# 문제 없으면 전체 빌드 (--limit 0)
-PYTHONPATH=. python etflowalign/scripts/01_build_aligned_pairs.py \
-  --root $DATA --out $CODE/geom_pt --limit 0
-```
-
-## 4) Phase 5 — overfit-100 (다음 단계, 러너 scripts/04 작성 예정)
-
-> `scripts/04_overfit100.py` 는 아직 미작성. harmonic 고유분해 사전계산 최적화와 함께
-> 곧 추가 예정. 추가되면 여기 명령을 채운다.
+→ `$CODE/geom_pt/*.pt` (per-sample 텐서). shape_overlap>0.5 면 정렬 양호.
 
 ---
 
-## 성능 메모
-- 대규모 학습 전: `torch.set_float32_matmul_precision("high")` 권장 (A10 tf32).
-- Phase 6(full 65k) 전 벡터화 필수 부채: HarmonicSampler eigh 루프, center_pos 루프
-  (tree.txt "성능 부채" 참조).
+## 3) 학습/진단 = sbatch 러너 (scripts/run_overfit.sh)
+
+**환경변수로 파라미터 지정, sbatch로 제출.** 로그: `etfa_of_<jobid>.log` (제출 디렉터리).
+
+```bash
+# overfit 기본 (100개, 조건부)
+sbatch etflowalign/scripts/run_overfit.sh
+
+# 진단 예시 — 분자 1개, 분산↓(B1), 비조건
+N=1 UNCOND=--unconditional MICRO=8 sbatch --time=00:40:00 etflowalign/scripts/run_overfit.sh
+
+# eval-only (재학습 없이 저장 체크포인트로 샘플만; 샘플스텝·지표 재측정)
+N=20 UNCOND=--unconditional LOAD=$CODE/overfit_20_uc_ckpt.pt SAMPLE=500 sbatch etflowalign/scripts/run_overfit.sh
+```
+
+**러너 환경변수 (run_overfit.sh):**
+
+| 변수 | 기본 | 뜻 |
+|---|---|---|
+| `N` | 100 | 분자 수 |
+| `STEPS` | 30000 | 학습 스텝 |
+| `BATCH` | 8 | 미니배치 분자 수 (OOM 시 낮춤) |
+| `HIDDEN`/`LAYERS` | 256/8 | 백본 크기 |
+| `SAMPLE` | 100 | ODE 샘플 스텝 |
+| `MICRO` | 1 | 스텝당 (x0,t) 샘플 수 (K>1=분산↓, B1) |
+| `FORCE` | (없음) | `--force-align` 진단(오라클 회전제거) |
+| `UNCOND` | (없음) | `--unconditional` 진단(reference 제거) |
+| `LOAD` | (없음) | 체크포인트 경로 → eval-only |
+
+**결과 읽기 (GATE B 블록):** `median heavy-atom RMSD`(표준 지표), `<1A/<2A 비율`,
+`prior 기준선`, 원자조성(H비율), 크기별 진단.
+
+## 4) 확인 / 큐 관리
+
+```bash
+squeue --me                              # 내 job 상태 (PD 대기 / R 실행)
+squeue --me --start                      # 예상 시작 시각
+tail -40 $(ls -t etfa_of_*.log | head -1)   # 최신 로그 끝
+sinfo -p a10,a40,h100                     # 파티션별 여유
+```
+- **큐가 붐벼 안 잡히면 짧은 `--time`으로 backfill 유도**(예 `--time=00:10:00`) — 짧은 job이
+  큰 job들 사이 빈틈에 먼저 들어감. 필요 자원만 짧게 요청 = 빨리 실행.
+- 덜 붐비는 파티션: `sbatch --partition=a40 ...` (a40/h100도 NVIDIA, 코드 그대로 동작).
+
+---
+
+## 성능 메모 (Phase 6 full 65k 전 벡터화 필요)
+- HarmonicSampler eigh/파이썬 루프, center_pos 루프 → scatter 기반 벡터화.
+  (overfit 소규모는 PrecomputedHarmonicSampler 캐시로 완화됨)
+- build_radius_graph O(N^2) — drug-sized/미니배치8 OK, 대형 배치서 메모리↑.
+- 대규모 학습 시 `torch.set_float32_matmul_precision("high")` (A10 tf32).

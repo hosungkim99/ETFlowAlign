@@ -55,17 +55,18 @@
 | 필드 | 모양 | 설명 |
 |---|---|---|
 | `z` | `[Nq]` long | query 원자종 |
-| `bonds` | `[2, Eq]` long | query 결합 인덱스 (양방향) |
-| `bond_type` | `[Eq]` long | 결합 차수 (harmonic prior에 사용) |
-| `x1` | `[Nq, 3]` float | **학습 타깃** = 정렬된 query 좌표 |
+| `bonds` | `[2, 2Eq]` long | query 결합 (양방향 저장) |
+| `bond_type` | `[2Eq]` long | 결합 차수 코드 (bonds와 정렬) |
+| `pos` | `[Nq, 3]` float | query 좌표 = **학습 타깃 x1** (reference에 정렬된 conformer) |
 | `ref_z` | `[Nr]` long | reference 원자종 |
 | `ref_pos` | `[Nr, 3]` float | reference 좌표 (조건) |
 | `mol_id` | str | 추적용 메타 |
 
 배치는 PyG 스타일 `batch` 인덱스로 여러 샘플을 연결한다.
+(코드에서 타깃 좌표의 키 이름은 `pos`이며, 개념상 x1과 동일하다.)
 
 ### 3.2 데이터 게이트 (Phase 1)
-- 무작위 몇 쌍을 SDF로 내보내 **reference와 x1이 실제로 형상 정렬되어 있는지 눈으로 확인**한다.
+- 무작위 몇 쌍을 SDF로 내보내 **reference와 query(pos)가 실제로 형상 정렬되어 있는지 눈으로 확인**한다.
 - 데이터가 틀리면 모델은 배울 수 없다 — 이 게이트를 통과하기 전엔 학습 코드로 넘어가지 않는다.
 
 ---
@@ -76,17 +77,27 @@
 - **harmonic prior**: 분자 결합 그래프의 라플라시안 기반. 시작점부터 대략적 결합거리(~1.5Å) 유지.
 - `x0 ~ harmonic(bonds)`. (게이트 A 이전엔 gaussian도 fallback으로 둔다.)
 
-### 4.2 Path (보간 경로)
+### 4.2 Path (보간 경로) + source 정렬
 - 기본 = linear: `x_t = (1-t)·x0 + t·x1`, 목표 속도 `u = x1 - x0`.
-- source↔target을 Kabsch로 정렬해 회전 자유도를 줄인다(옵션). **주의**: 과거 `pc @ r` vs `pc @ r.T` transpose 버그 있었음 — 단위테스트로 검증.
+- **source→target Kabsch 정렬 (비조건 모드 필수, `FlowConfig.kabsch_source_align`, 기본 on).**
+  등변 백본은 무작위 방향 x0를 고정 방향 x1로 매핑할 수 없으므로(등변성 위반),
+  x0를 x1에 회전정렬해 "모양 형성"만 학습시킨다. 생성 시 방향은 등변성이 처리
+  (raw RMSD는 크게 나오는 게 정상, **aligned RMSD로 평가**). Gate A를 뚫은 핵심 장치.
+- **조건부 모드에선 정렬 OFF** — reference가 프레임을 고정하므로 pose 자체를 학습.
+  (과거 `pc@r` vs `pc@r.T` transpose 버그는 `kabsch_align_source_to_target` 자체검증으로 해결)
 
 ### 4.3 Loss
 - `batchwise_l2`: 분자별 `||v_θ - u||` 평균 후 배치 평균. (ET-Flow와 동일.)
 - **보조손실 없음** (bond/clash penalty 없음). DiffAlign도 auxiliary loss 없음.
 
 ### 4.4 Sampler
-- 학습된 `v_θ`를 ODE로 적분 (Euler/few-step). `t: 0 → 1`.
-- 추론 시 포켓 UFF 가이던스를 각 스텝 속도에 더할 수 있음(옵션).
+- 학습된 `v_θ`를 ODE로 적분 (Euler, `n_steps`). `t: 0 → 1`.
+- eval-only 시 시작점 `x0`를 직접 주입 가능(진단). 포켓 UFF 가이던스 훅(추론)은 Phase 7.
+
+### 4.5 학습 안정화 (train.py)
+- **EMA** (가중치 지수이동평균, 기본 on): 생성엔 EMA 가중치 사용(FM 표준).
+- **n_micro**: 스텝당 여러 `(x0,t)`를 평균해 gradient 분산↓(안정화/진단).
+- **NaN 방어**: clip_grad_norm + nan_to_num, 연속 NaN 시 best 롤백.
 
 ---
 
@@ -118,7 +129,7 @@ ET-Flow의 torchmd-net은 로컬에서 0바이트 플레이스홀더 → **직�
 ### 5.4 임베딩 / 출력
 - 입력: `z → h`(Embedding), `vec = 0`.
 - 시간 `t`: sinusoidal → MLP → `h`에 더함.
-- reference: 추가 노드 + query↔ref 메시지패싱(상대 기하만).
+- reference: 추가 노드(`is_ref` 플래그, 불변) + query↔ref 메시지패싱(상대 기하만). 출력은 query 노드만.
 - 출력 헤드: 벡터 피처 채널 가중합 → 원자당 속도 `v_θ ∈ R^{N×3}`.
 
 ### 5.5 안정화 3종 세트 (필수 — 과거 실증, 없으면 발산)
@@ -141,7 +152,8 @@ h(R·x, ...) == h(x, ...)                       (불변)
 
 ## 7. 평가 명세
 
-- **지표**: Top-1 RMSD @ 1/2/3Å, Kabsch-aligned RMSD(형상만), TanimotoCombo 랭킹.
+- **지표**: **heavy-atom Kabsch-aligned RMSD**(수소 제외 = 표준; GEOM 데이터는 H 없음),
+  Top-1 RMSD @ 1/2/3Å, TanimotoCombo 랭킹. (raw RMSD는 방향 포함이라 참고용)
 - **벤치마크**: DISCO식 (원본 DiffAlign 평가 프로토콜 참고), 샘플 다수(예 30) 생성 후 랭킹.
 - **prior 대비**: 생성 결과가 시작 노이즈(prior)보다 나아야 의미 있음.
 
@@ -156,12 +168,16 @@ h(R·x, ...) == h(x, ...)                       (불변)
 | 2 | 조건 없는 FM 코어 | **게이트 A**: 소수 분자에서 정상 결합길이의 3D 구조 생성 |
 | 3 | 등변 백본 | **등변성 테스트** < 1e-5 (§6) |
 | 4 | reference 조건화 | 등변성 테스트 재통과 |
-| 5 | overfit-100 | **게이트 B**: aligned RMSD < 2Å |
+| 5 | overfit-100 | **게이트 B**: median heavy-atom aligned RMSD < 2Å |
 | 6 | 일반화 (65k + val) | **게이트 C**: val aligned RMSD < prior source RMSD |
 | 7 | 평가 + 포켓 가이던스 | DISCO식 Top-1 RMSD 산출 |
 
 **철학**: "loss 감소"가 아니라 "실제 생성 성공"을 게이트로 삼는다.
 생성 모델은 loss가 내려가도 생성이 실패할 수 있다(과거의 핵심 교훈).
+
+> ⚠️ **게이트 A 주의(실증됨):** 합성 소분자는 harmonic prior 분포와 거의 같아
+> transport가 trivial 하므로, 게이트 A 통과는 **실분자 생성 능력의 검증이 아니다.**
+> 실분자 생성의 진짜 시험은 Phase 5(overfit) 이후다.
 
 ---
 
@@ -179,25 +195,34 @@ h(R·x, ...) == h(x, ...)                       (불변)
 
 ```
 etflowalign/
-├── SPEC.md                 # (이 문서)
+├── SPEC.md                 # (이 문서) 설계 캐논
+├── tree.txt                # Phase별 진행 추적
+├── SERVER_RUN.md           # SLURM 실행 가이드
 ├── backbone/
+│   ├── utils.py            # safe_norm/soft_normalize/scatter/radius_graph
 │   ├── rbf.py              # expnorm RBF + cosine cutoff
 │   ├── layers.py           # EquivariantAttention + GatedEquivariantBlock
-│   ├── embedding.py        # 원자종/시간/reference 임베딩
-│   └── network.py          # 블록 스택 → 속도장 헤드
+│   ├── embedding.py        # 원자종/시간/reference(is_ref) 임베딩
+│   └── network.py          # 블록 스택 → 속도장 헤드 (조건부 forward)
 ├── flow/
-│   ├── prior.py            # harmonic prior 샘플러
-│   ├── path.py             # 보간 경로 + 목표 속도
+│   ├── prior.py            # harmonic/gaussian + PrecomputedHarmonicSampler
+│   ├── path.py             # 보간 경로 + Kabsch 정렬/RMSD + 중심화
 │   └── loss.py             # batchwise_l2
 ├── data/
-│   └── pairs.py            # 정렬쌍 .sdf → 텐서
-├── guidance.py             # 포켓 UFF 가이던스 (추론)
-├── sampler.py              # ODE 적분
-├── train.py
-├── evaluation.py
+│   └── pairs.py            # 정렬쌍 .sdf → 텐서 + collate
+├── guidance.py             # 포켓 UFF 가이던스 (추론, Phase 7 예정)
+├── sampler.py              # ODE 적분 (조건부/eval x0 주입)
+├── train.py                # FlowConfig/EMA/flow_train_step/train_flow
+├── evaluation.py           # (Phase 7 예정)
+├── scripts/
+│   ├── 01_build_aligned_pairs.py / 02_visualize_pairs.py
+│   ├── 03_smoke_generate.py       # 게이트 A
+│   ├── 04_overfit100.py           # 게이트 B + 진단(force-align/uncond/micro/load)
+│   └── run_overfit.sh             # sbatch 러너
 └── tests/
-    └── test_equivariance.py
+    ├── test_equivariance.py       # Phase3+4 등변성
+    ├── test_smoke_run.py / test_data_pairs.py / test_conditional_flow.py
 ```
 
 **격리 원칙**: `backbone/`은 태스크/조건을 모르는 순수 등변 네트워크 →
-Phase 2에서 단독 검증 가능. 조건화는 `embedding.py`에만 국한.
+단독 검증 가능. 조건화는 `embedding.py`(is_ref)와 `network.py` forward 에 국한.
