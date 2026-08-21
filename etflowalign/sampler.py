@@ -1,155 +1,50 @@
-"""ODE sampling for ETFlowAlign with safe guidance injection policies."""
+"""ODE 샘플러: x0 ~ prior 에서 시작해 v_θ 를 적분하여 x1 생성.
+
+dx/dt = v_θ(x, t),  t: 0 -> 1,  Euler 적분 (few-step).
+포켓 UFF 가이던스 훅은 옵션 (Phase 7 에서 연결).
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Literal, Optional
-
 import torch
-from torch import Tensor
-
-from .model import AlignmentBatch, ETFlowAlignModel
-
-GuidanceFn = Callable[[AlignmentBatch, Tensor, Tensor], Tensor]
+from torch import Tensor, nn
 
 
-@dataclass
-class ODESamplerConfig:
-    """Configuration for ODE inference.
+@torch.no_grad()
+def ode_sample(
+    model: nn.Module,
+    z: Tensor,
+    bonds: Tensor,
+    batch: Tensor,
+    prior,
+    n_steps: int = 50,
+    guidance_fn=None,
+    x0: Tensor = None,
+    ref_z: Tensor = None,
+    ref_pos: Tensor = None,
+    ref_batch: Tensor = None,
+) -> Tensor:
+    """ODE 샘플링. ref_* 가 주어지면 reference 조건화 모드(ref 고정).
 
-    Attributes:
-        n_steps: Number of integration steps from t_start to t_end.
-        t_start: Initial integration time.
-        t_end: Final integration time.
-        solver: Numerical solver (Euler or Heun).
-        guidance_scale: Global multiplier for external guidance.
-        guidance_mode: How guidance is injected.
-        max_guidance_norm: Per-atom norm cap for guidance vectors.
-        pc_corrector_step_scale: Step scale for predictor-corrector correction.
-        adaptive_dt: Enable simple adaptive step scaling by velocity norm.
-        adaptive_dt_max_scale: Maximum multiplier for adaptive dt.
+    model: forward(z, pos, t, batch[, ref_z, ref_pos, ref_batch]) -> v [Nq,3]
+    x0:    지정 시 그 시작점 사용, 아니면 prior 에서 샘플
+    반환:  생성된 query 좌표 x1 [Nq, 3]  (reference 는 고정, 반환 안 함)
     """
+    model.eval()
+    num_graphs = int(batch.max().item()) + 1
+    conditioned = ref_z is not None
+    x = prior.sample(z, bonds, batch) if x0 is None else x0.clone()
+    dt = 1.0 / n_steps
 
-    n_steps: int = 50
-    t_start: float = 0.0
-    t_end: float = 1.0
-    solver: Literal["euler", "heun"] = "heun"
-    guidance_scale: float = 0.0
-    guidance_mode: Literal["vector_field", "predictor_corrector"] = "vector_field"
-    max_guidance_norm: float = 5.0
-    pc_corrector_step_scale: float = 1.0
-    adaptive_dt: bool = False
-    adaptive_dt_min_scale: float = 0.1
-    adaptive_dt_max_scale: float = 2.0
-    log_trajectory: bool = False
-    max_trace_steps: int = 2000
+    for k in range(n_steps):
+        t_val = k * dt
+        t = torch.full((num_graphs,), t_val, device=z.device, dtype=x.dtype)
+        if conditioned:
+            v = model(z, x, t, batch, ref_z, ref_pos, ref_batch)
+        else:
+            v = model(z, x, t, batch)
+        if guidance_fn is not None:
+            v = v + guidance_fn(x, t, batch)  # 포켓 UFF 등 (Phase 7)
+        x = x + dt * v
 
-
-class ETFlowAlignSampler:
-    """ODE sampler for alignment flow matching.
-
-    Guidance mode:
-        - vector_field: add guidance directly to velocity before state update.
-        - predictor_corrector: apply guidance as a separate correction step.
-    """
-
-    def __init__(self, model: ETFlowAlignModel, config: ODESamplerConfig) -> None:
-        self.model = model
-        self.config = config
-
-    def _clip_guidance(self, g: Tensor) -> Tensor:
-        norm = torch.norm(g, dim=-1, keepdim=True).clamp_min(1e-8)
-        return g * (self.config.max_guidance_norm / norm).clamp(max=1.0)
-
-    def _model_v(self, batch: AlignmentBatch, x: Tensor, t_graph: Tensor) -> Tensor:
-        cur = AlignmentBatch(
-            query_pos=x,
-            query_atom_type=batch.query_atom_type,
-            query_batch=batch.query_batch,
-            reference_pos=batch.reference_pos,
-            reference_atom_type=batch.reference_atom_type,
-            reference_batch=batch.reference_batch,
-            pocket_pos=batch.pocket_pos,
-            pocket_batch=batch.pocket_batch,
-            pocket_atom_type=batch.pocket_atom_type,
-            query_node_attr=batch.query_node_attr,
-            reference_node_attr=batch.reference_node_attr,
-        )
-        return self.model(cur, t_graph=t_graph)
-
-    def _apply_guidance(
-        self,
-        batch: AlignmentBatch,
-        x: Tensor,
-        t_graph: Tensor,
-        v: Tensor,
-        guidance_fn: Optional[GuidanceFn],
-        dt: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        if guidance_fn is None or self.config.guidance_scale <= 0.0:
-            return x, v
-
-        cur = AlignmentBatch(
-            query_pos=x,
-            query_atom_type=batch.query_atom_type,
-            query_batch=batch.query_batch,
-            reference_pos=batch.reference_pos,
-            reference_atom_type=batch.reference_atom_type,
-            reference_batch=batch.reference_batch,
-            pocket_pos=batch.pocket_pos,
-            pocket_batch=batch.pocket_batch,
-            pocket_atom_type=batch.pocket_atom_type,
-            query_node_attr=batch.query_node_attr,
-            reference_node_attr=batch.reference_node_attr,
-        )
-        g = self._clip_guidance(guidance_fn(cur, t_graph, v))
-
-        if self.config.guidance_mode == "vector_field":
-            return x, v + self.config.guidance_scale * g
-
-        # predictor-corrector: explicit x-state correction scaled by actual dt.
-        if dt is None:
-            raise ValueError("predictor_corrector guidance requires dt.")
-        x_corrected = x + self.config.pc_corrector_step_scale * self.config.guidance_scale * dt * g
-        return x_corrected, v
-
-    @torch.no_grad()
-    def sample(self, batch: AlignmentBatch, x0: Tensor, guidance_fn: Optional[GuidanceFn] = None) -> Tensor:
-        num_graphs = int(batch.query_batch.max().item()) + 1
-        t_grid = torch.linspace(self.config.t_start, self.config.t_end, self.config.n_steps + 1, device=x0.device)
-
-        x = x0.clone()
-        for i in range(self.config.n_steps):
-            t = t_grid[i]
-            dt = t_grid[i + 1] - t
-            t_graph = torch.full((num_graphs,), float(t), device=x.device)
-
-            v = self._model_v(batch, x, t_graph)
-            if not torch.isfinite(v).all():
-                raise FloatingPointError(f"Non-finite velocity at step={i}, t={float(t):.6f}.")
-            x, v = self._apply_guidance(batch, x, t_graph, v, guidance_fn, dt=dt)
-
-            if self.config.solver == "euler":
-                x = x + dt * v
-            else:
-                x_pred = x + dt * v
-                t_next = torch.full((num_graphs,), float(t_grid[i + 1]), device=x.device)
-
-                if self.config.guidance_mode == "predictor_corrector" and guidance_fn is not None and self.config.guidance_scale > 0.0:
-                    # (a) predictor_corrector mode: explicitly apply corrected predictor state.
-                    v_pred = self._model_v(batch, x_pred, t_next)
-                    x_pred, _ = self._apply_guidance(batch, x_pred, t_next, v_pred, guidance_fn, dt=dt)
-
-                v_next = self._model_v(batch, x_pred, t_next)
-                if not torch.isfinite(v_next).all():
-                    raise FloatingPointError(
-                    f"Non-finite coordinates during ODE integration at step={i}, t={float(t):.6f}. "
-                    "Check velocity scale, solver step size, batch fields, or model rollout stability."
-                )
-                _, v_next = self._apply_guidance(batch, x_pred, t_next, v_next, guidance_fn, dt=dt)
-                x = x + 0.5 * dt * (v + v_next)
-
-            if not torch.isfinite(x).all():
-                raise FloatingPointError("Non-finite coordinates during ODE integration. Reduce guidance scale.")
-
-        return x
+    return x

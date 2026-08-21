@@ -1,456 +1,160 @@
-"""Training script and utilities for ETFlowAlign.
+"""flow-matching 학습 루프 (Phase 2: 조건 없음).
 
-Examples:
-    python -m etflowalign.train --synthetic-smoke --steps 2 --batch-size 2 --n-atoms 8 --save-path /tmp/etflowalign_smoke.pt
-    python -m etflowalign.train --train-data /path/to/train_batch.pt --steps 1 --save-path /tmp/etflowalign_ckpt.pt
+한 스텝:
+  t ~ U(0,1) (분자별) -> x0 ~ prior -> x_t=(1-t)x0+t·x1 -> v_θ(x_t,t)
+  loss = batchwise_l2(v_θ, x1-x0)
+
+안정화: clip_grad_norm + nan_to_num (과거 NaN 크래시 방지).
+best 손실 즉시 보관, NaN step 은 이전 best 로 롤백.
 """
 
 from __future__ import annotations
 
-import argparse
-import math
+import copy
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
-from torch import Tensor, optim
+from torch import nn
 
-from .data import load_alignment_batch_from_pt
-from .dataset import AlignmentDataset, sample_training_batch, train_val_split
-from .evaluation import evaluate_paths, format_summary
-from .flow_matching import AlignmentFlowMatcher, FlowMatchingConfig, flow_matching_step
-from .model import AlignmentBatch, ETFlowAlignModel
+from etflowalign.flow.loss import batchwise_l2_loss
+from etflowalign.flow.path import (
+    center_by_reference,
+    center_pos,
+    interpolate,
+    kabsch_align_source_to_target,
+    sample_time,
+    target_velocity,
+)
+from etflowalign.flow.prior import get_prior
 
 
 @dataclass
-class TrainConfig:
-    """Optimization hyperparameters for ETFlowAlign training."""
-
-    lr: float = 1e-4
-    weight_decay: float = 0.0
-    lambda_bond: float = 0.0
-
-
-def build_training_components(
-    model: ETFlowAlignModel,
-    train_config: TrainConfig,
-    fm_config: FlowMatchingConfig,
-) -> tuple[AlignmentFlowMatcher, optim.Optimizer]:
-    """Create flow matcher and optimizer."""
-    matcher = AlignmentFlowMatcher(config=fm_config)
-    optimizer = optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
-    return matcher, optimizer
+class FlowConfig:
+    prior: str = "gaussian"      # "gaussian" | "harmonic"
+    prior_scale: float = 1.0
+    lr: float = 2e-4
+    grad_clip: float = 10.0
+    steps: int = 2000
+    log_every: int = 200
+    use_ema: bool = True         # 가중치 지수이동평균(생성 품질↑, FM 표준)
+    ema_decay: float = 0.999
+    kabsch_source_align: bool = True  # 비조건 학습 시 source->target 회전정렬(등변 필수)
+    force_conditioned_align: bool = False  # 진단용: 조건부에서도 정렬 강제(회전 제거)
+    n_micro: int = 1             # 스텝당 (x0,t) 샘플 수(K>1=분산↓, B1)
 
 
-def train_step(
-    model: ETFlowAlignModel,
-    matcher: AlignmentFlowMatcher,
-    optimizer: optim.Optimizer,
-    batch: AlignmentBatch,
-    target_query_pos: Tensor,
-    lambda_bond: float = 0.0,
-) -> float:
-    """Run one optimization step and return scalar loss."""
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
+class EMA:
+    """부동소수 파라미터의 지수이동평균. 생성 시 EMA 가중치가 더 매끄럽다."""
 
-    loss = flow_matching_step(
-        model,
-        matcher,
-        batch,
-        target_query_pos,
-        lambda_bond=lambda_bond,
-    )
-
-    loss_check = float(loss.detach())
-    if not math.isfinite(loss_check) or abs(loss_check) > 1e4:
-        # Skip non-finite OR exploding losses (normal loss is ~10-200). Raising here
-        # bypasses backward/step so one runaway batch cannot corrupt the weights; the
-        # caller rolls back to the best checkpoint and continues.
-        raise FloatingPointError(f"Non-finite/exploding training loss before backward: {loss_check}")
-
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-    # Sanitize non-finite gradients before stepping. clip_grad_norm_ does NOT guard against
-    # this: a single NaN/Inf gradient makes its total_norm NaN and then poisons every weight,
-    # so the next forward pass produces NaN and training dies. Zeroing the bad grads turns a
-    # rare unstable step into a no-op instead of a crash.
-    for param in model.parameters():
-        if param.grad is not None:
-            torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
-    optimizer.step()
-
-    loss_value = float(loss.detach().cpu().item())
-    if not math.isfinite(loss_value):
-        raise FloatingPointError(
-            f"Non-finite training loss after optimization step: {loss_value}"
-        )
-
-    return loss_value
-
-
-def make_synthetic_alignment_batch(batch_size: int, n_atoms: int, device: torch.device) -> tuple[AlignmentBatch, Tensor]:
-    """Create toy alignment batch for smoke tests."""
-    query_batch = torch.arange(batch_size, device=device).repeat_interleave(n_atoms)
-    reference_batch = query_batch.clone()
-
-    reference_pos = 0.7 * torch.randn(batch_size * n_atoms, 3, device=device)
-    atom_type = torch.randint(low=0, high=16, size=(batch_size * n_atoms,), device=device)
-
-    translation = 0.25 * torch.randn(batch_size, 3, device=device)
-    target_query_pos = reference_pos + translation[query_batch]
-    target_query_pos = target_query_pos + 0.05 * torch.sin(target_query_pos * 2.0)
-
-    query_init = reference_pos + 0.8 * torch.randn_like(reference_pos)
-    batch = AlignmentBatch(
-        query_pos=query_init,
-        query_atom_type=atom_type,
-        query_batch=query_batch,
-        reference_pos=reference_pos,
-        reference_atom_type=atom_type,
-        reference_batch=reference_batch,
-    )
-    return batch, target_query_pos
-
-
-def _clone_state_dict_to_cpu(model: ETFlowAlignModel) -> dict[str, torch.Tensor]:
-    """Clone model parameters to CPU for checkpointing."""
-    return {
-        key: value.detach().cpu().clone()
-        for key, value in model.state_dict().items()
-    }
-
-
-def _make_best_checkpoint_path(save_path: str) -> Path:
-    """Create best-checkpoint path from final checkpoint path."""
-    path = Path(save_path)
-    if path.suffix == ".pt":
-        return path.with_name(f"{path.stem}_best{path.suffix}")
-    return Path(f"{save_path}.best.pt")
-
-
-def run_training(args: argparse.Namespace) -> None:
-    """CLI training entrypoint."""
-    device = torch.device(args.device)
-
-    model_args = {
-        "hidden_dim": args.hidden_dim,
-        "num_blocks": args.num_blocks,
-        "use_atom_index_embed": args.use_atom_index_embed,
-        "use_equivariant_basis_head": args.use_equivariant_basis_head,
-        "use_rigid_head": args.use_rigid_head,
-        "use_pocket_conditioning": args.use_pocket_conditioning,
-        "pocket_cutoff": args.pocket_cutoff,
-        "pocket_max_neighbors": args.pocket_max_neighbors,
-        "use_reference_conditioning": args.use_reference_conditioning,
-        "reference_cutoff": args.reference_cutoff,
-        "reference_max_neighbors": args.reference_max_neighbors,
-        "use_node_attr": args.use_node_attr,
-        "node_attr_dim": args.node_attr_dim,
-        "max_atoms": args.max_atoms,
-    }
-
-    model = ETFlowAlignModel(**model_args).to(device)
-
-    flow_args = {
-        "sigma": args.sigma,
-        "source_type": args.source_type,
-        "source_noise_scale": args.source_noise_scale,
-        "center_source": args.center_source,
-        "center_target": args.center_target,
-        "use_kabsch_alignment": args.use_kabsch_alignment,
-        "fixed_t": args.fixed_t,
-        "path_type": args.path_type,
-    }
-
-    fm_config = FlowMatchingConfig(**flow_args)
-
-    train_config = TrainConfig(lr=args.lr, weight_decay=args.weight_decay, lambda_bond=args.lambda_bond,)
-    matcher, optimizer = build_training_components(model, train_config, fm_config)
-
-    train_args = vars(args).copy()
-
-    dataset: AlignmentDataset | None = None
-    sample_generator: torch.Generator | None = None
-    val_paths: list[str] = []
-    if args.train_dir:
-        all_paths = AlignmentDataset.from_directory(args.train_dir, require_target=True).paths
-        if args.train_limit > 0:
-            all_paths = all_paths[: args.train_limit]
-        if args.val_fraction > 0.0:
-            train_paths, val_paths = train_val_split(all_paths, args.val_fraction, args.split_seed)
-            val_manifest = Path(f"{args.save_path}.val.txt")
-            val_manifest.parent.mkdir(parents=True, exist_ok=True)
-            val_manifest.write_text("\n".join(val_paths))
-            dataset = AlignmentDataset(train_paths, require_target=True)
-            print(f"[train] held-out val: {len(val_paths)} complexes (never trained) -> {val_manifest}")
-        else:
-            dataset = AlignmentDataset(all_paths, require_target=True)
-        sample_generator = torch.Generator().manual_seed(0)
-        print(
-            f"[train] dataset: {len(dataset)} train complexes from {args.train_dir} "
-            f"| conditioning={args.conditioning} batch_size={args.batch_size}"
-        )
-        if args.use_pocket_conditioning:
-            _probe_batch, _ = dataset[0]
-            _has_chem = _probe_batch.pocket_atom_type is not None
-            print(
-                "[train] pocket conditioning: ON | pocket atom types (chemistry): "
-                + ("present" if _has_chem else "ABSENT -> fallback token (re-extract the dataset!)")
-            )
-
-    save_path = Path(args.save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    best_path = _make_best_checkpoint_path(args.save_path)
-    best_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _checkpoint(model_state: dict[str, torch.Tensor], extra: dict) -> dict:
-        ckpt = {
-            "model_state": model_state,
-            "model_args": model_args,
-            "flow_args": flow_args,
-            "train_args": train_args,
+    def __init__(self, model, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+            if v.dtype.is_floating_point
         }
-        ckpt.update(extra)
-        return ckpt
-    
-    best_loss = float("inf")
-    best_step: int | None = None
-    best_model_state: dict[str, torch.Tensor] | None = None
-    final_loss: float | None = None
-    consecutive_failures = 0
-    max_consecutive_failures = 20
 
-    for step in range(1, args.steps + 1):
-        if args.synthetic_smoke:
-            batch, target_query_pos = make_synthetic_alignment_batch(
-                args.batch_size,
-                args.n_atoms,
-                device,
-            )
-        elif dataset is not None:
-            batch, target_query_pos = sample_training_batch(
-                dataset,
-                batch_size=args.batch_size,
-                conditioning=args.conditioning,
-                device=device,
-                generator=sample_generator,
-            )
-            assert target_query_pos is not None
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+
+    def copy_to(self, model):
+        sd = model.state_dict()
+        for k in self.shadow:
+            sd[k].copy_(self.shadow[k])
+        model.load_state_dict(sd)
+
+
+def flow_train_step(model, batch, prior, optimizer, grad_clip: float,
+                    kabsch_align: bool = False, force_conditioned_align: bool = False,
+                    n_micro: int = 1):
+    """단일 배치 학습 스텝. 반환: loss 값(float).
+
+    batch 에 ref_z 가 있으면 reference 조건화 모드로 동작한다.
+    kabsch_align: 비조건 모드에서 source(x0)를 target(x1)에 회전정렬(등변 필수).
+    n_micro: 스텝당 (x0,t) 샘플 수. K>1 이면 grad 누적으로 분산↓ (B1).
+    """
+    model.train()
+    z, x1, bonds, b = batch["z"], batch["pos"], batch["bonds"], batch["batch"]
+    B = int(b.max().item()) + 1
+    conditioned = batch.get("ref_z") is not None
+
+    if conditioned:
+        ref_z, ref_pos, ref_batch = batch["ref_z"], batch["ref_pos"], batch["ref_batch"]
+        x1, ref_pos = center_by_reference(x1, b, ref_pos, ref_batch, B)  # ref COM 기준
+    else:
+        x1 = center_pos(x1, b)                      # 타깃 중심화
+
+    prior_b = batch.get("_prior", prior)            # 배치별 캐시 prior 우선
+    optimizer.zero_grad()
+    total = 0.0
+    for _ in range(n_micro):                        # 여러 (x0,t) 평균 -> 분산↓
+        t = sample_time(B, device=z.device)
+        x0 = prior_b.sample(z, bonds, b)            # query 시작점
+        if kabsch_align and (not conditioned or force_conditioned_align):
+            # 무작위 방향 x0 를 x1 방향에 정렬 -> 등변 모델이 모양만 학습
+            x0 = kabsch_align_source_to_target(x0, x1, b, B)
+        xt = interpolate(x0, x1, t, b)
+        u = target_velocity(x0, x1)                 # 목표 속도
+        if conditioned:
+            v = model(z, xt, t, b, ref_z, ref_pos, ref_batch)
         else:
-            batch, target_query_pos, _ = load_alignment_batch_from_pt(
-                args.train_data,
-                require_target=True,
-                device=device,
-            )
-            assert target_query_pos is not None
+            v = model(z, xt, t, b)
+        loss = batchwise_l2_loss(v, u, b)
+        (loss / n_micro).backward()                 # grad 누적
+        total += float(loss.detach())
 
-        try:
-            loss = train_step(
-                model=model,
-                matcher=matcher,
-                optimizer=optimizer,
-                batch=batch,
-                target_query_pos=target_query_pos,
-                lambda_bond=train_config.lambda_bond,
-            )
-            step_loss = float(loss)
-            if not math.isfinite(step_loss):
-                raise FloatingPointError(f"Non-finite loss at step={step}: {step_loss}.")
-        except FloatingPointError as exc:
-            consecutive_failures += 1
-            # The guard fires BEFORE backward/step, so the weights are unchanged by this bad
-            # batch. The right response is to SKIP it and keep the (good) current weights, so
-            # progress accumulates. Rolling back to best on every spike would reset all
-            # progress and trap training (doom loop) when spikes are frequent.
-            if consecutive_failures > max_consecutive_failures:
-                # Many failures in a row -> weights likely in a bad region. Escape to best
-                # (or abort if we never had a finite step).
-                if best_model_state is None:
-                    raise
-                print(f"[train] step={step:04d} {consecutive_failures} consecutive non-finite; restoring best@{best_step} and continuing.")
-                model.load_state_dict(best_model_state)
-                optimizer.state.clear()
-                consecutive_failures = 0
-            elif step % args.log_every == 0 or consecutive_failures <= 3:
-                print(f"[train] step={step:04d} skipped (non-finite/exploding loss); weights unchanged.")
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # clip 은 NaN 을 못 막음 -> 잔여 NaN/Inf grad 를 0 으로 (과거 교훈)
+    for p in model.parameters():
+        if p.grad is not None:
+            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+    optimizer.step()
+    return total / n_micro
+
+
+def train_flow(model: nn.Module, batches, cfg: FlowConfig, verbose: bool = True, prior=None):
+    """batches: 매 스텝 사용할 배치 dict 의 리스트(작으면 순환). 반환: best state_dict.
+
+    prior 를 지정하면 그걸 사용(예: PrecomputedHarmonicSampler), 아니면 cfg 로 생성.
+    """
+    if prior is None:
+        prior = get_prior(cfg.prior, scale=cfg.prior_scale)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    best_loss = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    ema = EMA(model, cfg.ema_decay) if cfg.use_ema else None
+    nan_streak = 0
+
+    for step in range(cfg.steps):
+        batch = batches[step % len(batches)]
+        loss = flow_train_step(model, batch, prior, optimizer, cfg.grad_clip,
+                               kabsch_align=cfg.kabsch_source_align,
+                               force_conditioned_align=cfg.force_conditioned_align,
+                               n_micro=cfg.n_micro)
+
+        if loss != loss or loss == float("inf"):    # NaN/Inf 방어
+            nan_streak += 1
+            model.load_state_dict(best_state)        # 이전 best 로 롤백
+            if nan_streak > 20:
+                raise RuntimeError("NaN 20회 초과 — 학습 중단")
             continue
+        nan_streak = 0
 
-        consecutive_failures = 0
-        final_loss = step_loss
-        
-        if final_loss < best_loss:
-            best_loss = final_loss
-            best_step = step
-            best_model_state = _clone_state_dict_to_cpu(model)
-            # Persist the best immediately so a later crash cannot throw it away.
-            torch.save(
-                _checkpoint(best_model_state, {"best_loss": best_loss, "best_step": best_step}),
-                best_path,
-            )
+        if ema is not None:
+            ema.update(model)
+        if loss < best_loss:
+            best_loss = loss
+            best_state = copy.deepcopy(model.state_dict())
 
-        if step % args.log_every == 0 or step == 1:
-            best_info = f" best={best_loss:.6f}@{best_step}" if best_step is not None else ""
-            print(f"[train] step={step:04d} loss={final_loss:.6f}{best_info}")
-        
-        if val_paths and args.val_every > 0 and step % args.val_every == 0:
-            try:
-                model.eval()
-                val_summary, _ = evaluate_paths(
-                    model,
-                    val_paths,
-                    conditioning=args.conditioning,
-                    n_steps=args.val_eval_n_steps,
-                    solver=args.val_eval_solver,
-                    device=device,
-                    limit=args.val_eval_limit,
-                    flow_config=matcher.config,  # x0를 학습 source 분포에서 시작(일관성)
-                )
-                print(f"[val]   step={step:04d} {format_summary(val_summary)}")
-            except Exception as exc:  # noqa: BLE001 - val monitoring must never kill training
-                print(f"[val]   step={step:04d} skipped (eval error: {exc})")
-            finally:
-                model.train()
+        if verbose and (step % cfg.log_every == 0 or step == cfg.steps - 1):
+            print(f"[step {step:6d}] loss={loss:.4f}  best={best_loss:.4f}")
 
-    if final_loss is None:
-        raise RuntimeError("Training finished without running any optimization step.")
-
-    if best_model_state is None or best_step is None:
-        raise RuntimeError(
-            "No finite best checkpoint was captured. "
-            "Training likely failed before producing a valid loss."
-        )
-
-    torch.save(
-        _checkpoint(
-            _clone_state_dict_to_cpu(model),
-            {"final_loss": final_loss, "best_loss": best_loss, "best_step": best_step},
-        ),
-        save_path,
-    )
-    torch.save(
-        _checkpoint(best_model_state, {"best_loss": best_loss, "best_step": best_step}),
-        best_path,
-    )
-
-    print(f"[train] checkpoint saved to: {save_path}")
-    print(
-        f"[train] best checkpoint saved to: {best_path} "
-        f"at step={best_step} loss={best_loss:.6f}"
-    )
-
-def build_argparser() -> argparse.ArgumentParser:
-    """Define training CLI."""
-    p = argparse.ArgumentParser(description="Train ETFlowAlign.")
-    p.add_argument("--device", type=str, default="cpu")
-    p.add_argument("--steps", type=int, default=200)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--n-atoms", type=int, default=16)
-    p.add_argument("--hidden-dim", type=int, default=128)
-    p.add_argument("--num-blocks", type=int, default=4)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--sigma", type=float, default=0.05)
-    p.add_argument(
-        "--source-type",
-        type=str,
-        default="reference_anchored",
-        choices=["gaussian", "reference_anchored", "query_perturbed", "input_query"],
-    )
-    p.add_argument("--source-noise-scale", type=float, default=0.5)
-    p.add_argument("--use-atom-index-embed", action="store_true")
-    p.add_argument("--max-atoms", type=int, default=256)
-    p.add_argument(
-        "--use-equivariant-basis-head",
-        action="store_true",
-        help="Use an equivariant vector basis head instead of the legacy gate*x head.",
-    )
-    p.add_argument(
-        "--use-rigid-head",
-        action="store_true",
-        help="Direction A: predict a per-graph rigid-body velocity field (preserves geometry).",
-    )
-    p.add_argument(
-        "--use-pocket-conditioning",
-        action="store_true",
-        help="Feed pocket atoms into the model (ligand<->pocket messages + pocket-shape basis).",
-    )
-    p.add_argument("--pocket-cutoff", type=float, default=8.0, help="Ligand-pocket edge cutoff (A).")
-    p.add_argument("--pocket-max-neighbors", type=int, default=16, help="Max pocket neighbors per ligand atom.")
-    p.add_argument(
-        "--use-reference-conditioning",
-        action="store_true",
-        help="Feed reference atoms into the model (query<->reference messages + reference-shape basis). "
-             "DiffAlign-faithful reference shape conditioning.",
-    )
-    p.add_argument("--reference-cutoff", type=float, default=8.0, help="Query-reference edge cutoff (A).")
-    p.add_argument("--reference-max-neighbors", type=int, default=16, help="Max reference neighbors per query atom.")
-    p.add_argument(
-        "--path-type",
-        type=str,
-        default="linear",
-        choices=["linear", "rigid"],
-        help="Flow-matching probability path: linear coordinate interp or SE(3) rigid geodesic.",
-    )
-    p.add_argument(
-        "--use-node-attr",
-        action="store_true",
-        help="Use query_node_attr/reference_node_attr chemistry features if present.",
-    )
-    p.add_argument(
-        "--node-attr-dim",
-        type=int,
-        default=5,
-        help="Input dimension of node_attr features.",
-    )
-    p.add_argument(
-        "--lambda-bond",
-        type=float,
-        default=0.0,
-        help="Weight for endpoint bond length regularization.",
-    )
-    p.add_argument("--center-source", dest="center_source", action="store_true")
-    p.add_argument("--no-center-source", dest="center_source", action="store_false")
-    p.set_defaults(center_source=True)
-    p.add_argument("--center-target", dest="center_target", action="store_true")
-    p.add_argument("--no-center-target", dest="center_target", action="store_false")
-    p.set_defaults(center_target=True)
-    p.add_argument("--use-kabsch-alignment", dest="use_kabsch_alignment", action="store_true")
-    p.add_argument("--no-use-kabsch-alignment", dest="use_kabsch_alignment", action="store_false")
-    p.set_defaults(use_kabsch_alignment=True)
-    p.add_argument("--fixed-t", type=float, default=None)
-
-    p.add_argument("--log-every", type=int, default=20)
-    p.add_argument("--save-path", type=str, default="etflowalign_ckpt.pt")
-
-    p.add_argument("--synthetic-smoke", action="store_true")
-    p.add_argument("--train-data", type=str, default="", help="Single .pt batch (overfit/smoke).")
-    p.add_argument("--train-dir", type=str, default="", help="Directory of per-complex .pt payloads (dataset training).")
-    p.add_argument(
-        "--conditioning",
-        type=str,
-        default="pocket",
-        choices=["pocket", "reference", "both"],
-        help="Which conditioning signal to keep when training from --train-dir.",
-    )
-    p.add_argument("--val-fraction", type=float, default=0.0, help="Hold out this fraction of --train-dir as val (never trained on; written to <save-path>.val.txt).")
-    p.add_argument("--split-seed", type=int, default=0, help="Seed for the train/val split.")
-    p.add_argument("--train-limit", type=int, default=0, help="Use only the first N complexes of --train-dir (0 = all). For overfit diagnostics.") 
-    p.add_argument("--val-every", type=int, default=0, help="Evaluate held-out val pose RMSD every N steps (0 = off; needs --val-fraction>0).")
-    p.add_argument("--val-eval-limit", type=int, default=100, help="Evaluate at most this many val complexes per check (speed).")
-    p.add_argument("--val-eval-n-steps", type=int, default=50, help="ODE steps for val pose sampling.")
-    p.add_argument("--val-eval-solver", type=str, default="heun", choices=["euler", "heun"], help="Solver for val pose sampling.")
-    return p
-
-
-def main() -> None:
-    """CLI main."""
-    args = build_argparser().parse_args()
-    sources = [bool(args.synthetic_smoke), bool(args.train_data), bool(args.train_dir)]
-    if sum(sources) != 1:
-        raise ValueError("Provide exactly one of --synthetic-smoke, --train-data, or --train-dir.")
-    run_training(args)
-
-
-if __name__ == "__main__":
-    main()
+    # 생성용 가중치: EMA 우선(더 매끄러움), 없으면 best
+    if ema is not None:
+        ema.copy_to(model)
+    else:
+        model.load_state_dict(best_state)
+    return model.state_dict(), best_loss

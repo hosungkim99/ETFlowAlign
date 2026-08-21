@@ -1,0 +1,7 @@
+# ETFlowAlign 서버 의존성 (self-contained 백본이라 최소)
+# torch 는 서버 CUDA 에 맞는 빌드를 미리 설치할 것 (아래는 버전 하한 참고).
+torch>=2.1
+rdkit>=2023.9
+numpy>=1.24
+# 선택(평가/시각화 단계에서만 사용될 수 있음)
+# scipy
