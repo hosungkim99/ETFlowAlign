@@ -1,0 +1,301 @@
+================================================================================
+ ETFlowAlign — Phase별 작업 분해 (개조식)
+================================================================================
+ 기준 문서: SPEC.md  |  철학: 각 Phase는 "게이트"를 통과해야 다음으로 진행
+ 표기: [x] 완료  [ ] 예정  [~] 진행중
+================================================================================
+
+
+================================================================================
+ PHASE 0 · 설계 명세 고정                                              [x] 완료
+================================================================================
+- 목표: "ETFlowAlign이 무엇인가"를 애매함 없이 문서로 고정 (오독/우회로 차단)
+- 게이트: 정의 합의
+
+[산출물] SPEC.md
+  - 한 문장 정의 (harmonic prior -> reference 조건 -> 등변 속도장 -> ODE -> x1)
+  - 태스크 정의 (입력=query 그래프+reference 형상, 출력=정렬된 3D 좌표)
+  - 조건화 3규칙 (reference만 / 포켓은 추론 UFF만 / 상대기하로만)
+  - 데이터 명세 + per-sample 텐서 계약 (z, bonds, bond_type, x1, ref_z, ref_pos)
+  - 생성 엔진 명세 (harmonic prior / linear path / batchwise_l2 / ODE)
+  - 백본 명세 (F=256, layers=8, heads=8, rbf=64, cutoff=10)
+  - 안정화 3종 세트 (출력 zero-init / 스칼라 LayerNorm / 벡터 소프트정규화)
+  - 등변성 계약 (v(Rx)=Rv(x), 오차<1e-5)
+  - 7개 마일스톤/게이트 표
+  - 비목표 5개 (rigid / 포켓-인-네트워크 / PDBbind / torsion-only / 보조손실)
+  - 디렉터리 구조
+
+
+================================================================================
+ PHASE 3 · 등변 벡터-피처 백본 (선행 구현)                            [x] 완료
+================================================================================
+- 목표: 회전 대칭을 지키는 "속도장 예측 신경망"을 밑바닥부터 구현
+- 이유: 과거 병목 = 백본 표현력 부족 (스칼라-EGNN은 분자 모양 생성 불가)
+- 게이트: 등변성 테스트 통과 (회전 1.11e-15, 이동 1.89e-15) [PASS]
+
+[1] backbone/utils.py  — 공용 헬퍼
+    - safe_norm()          : 거리 0에서도 유한 그래디언트 (NaN 방지)
+    - soft_normalize()     : vec/(1+||vec||) 안정화 (SPEC §5.5)
+    - scatter_add()        : torch_scatter 의존성 없는 native 집계
+    - build_radius_graph() : 같은 분자 내 cutoff 이내 쌍 -> edge_index, r_ij, u_ij
+
+[2] backbone/rbf.py  — 거리 특징화
+    - CosineCutoff         : cutoff 반경에서 부드럽게 0으로 감쇠
+    - ExpNormalSmearing    : expnorm 방사 기저 함수 (거리 -> num_rbf 채널)
+
+[3] backbone/layers.py  — 등변 연산 블록
+    - EquivariantAttention : 스칼라 h[N,F] + 벡터 vec[N,3,F] 동시 갱신
+        · LayerNorm -> Q/K/V 투영
+        · 어텐션 = SiLU(q·k ⊙ dk) * cutoff
+        · 스칼라 메시지 s / 벡터 게이트 g1(피처) / g2(방향주입)
+        · Δvec = 이웃벡터⊙g1 + 방향û_ij⊙g2
+        · 출력투영 o1/o2/o3 -> dx = vec_dot*o2+o3, dvec = vec3*o1+집계
+    - GatedEquivariantBlock: 벡터피처 -> out_channels 개 3D 벡터
+        · zero_init 옵션으로 초기 출력 0 (안정화)
+
+[4] backbone/embedding.py  — 입력 임베딩
+    - SinusoidalTime       : 연속 시간 t in [0,1] -> sinusoidal
+    - AtomTimeEmbedding    : 원자종 z -> h, 시간 t 를 분자별로 더함
+    - (reference 조건 임베딩은 Phase 4에서 추가 예정)
+
+[5] backbone/network.py  — 조립
+    - EquivariantTransformer(F=256, layers=8, rbf=64, heads=8, cutoff=10)
+        · forward(z, pos, t, batch) -> v_θ [N,3]
+        · 임베딩 -> vec=0 초기화 -> 반경그래프 -> RBF/cutoff
+        · N개 등변 어텐션 블록 (매 블록 후 soft_normalize)
+        · out_norm(LayerNorm) -> velocity_head(zero-init) -> [N,3]
+
+[6] tests/test_equivariance.py  — 게이트
+    - 무작위 회전 R + 이동 τ 생성 (QR, det=+1)
+    - v(Rx+τ) == R·v(x)  검사 (회전 등변)
+    - v(x+τ)  == v(x)    검사 (이동 불변)
+    - 출력 비자명성(out_mag>1e-3) 확인 -> zero-init 공허통과 방지
+    - 실행: python -m etflowalign.tests.test_equivariance
+
+
+================================================================================
+ PHASE 1 · 데이터 파이프라인                                          [~] 코드완료
+================================================================================
+- 목표: GEOM-Drugs 유사분자 정렬쌍 -> per-sample 텐서 (새 계약대로 새로 빌드)
+- 게이트: reference와 x1이 실제로 형상 정렬돼 있는지 육안 확인 (서버 실데이터에서)
+- 상태: 코드 3종 + 로컬 왕복 테스트 통과. 실빌드/육안게이트는 서버에서.
+
+[1] data/pairs.py  — 정렬쌍 로더/빌더
+    - 입력: (reference.sdf, 정렬된 query.sdf) 쌍
+    - 필터 명세: 2D Tanimoto 0.55~0.85 AND 3D shape overlap > 0.5
+    - RDKit 파싱 -> z / bonds / bond_type / x1(정렬 query 좌표) / ref_z / ref_pos
+    - per-complex .pt 저장 (텐서 계약 SPEC §3.1 준수)
+    - PyG 스타일 batch 인덱스로 콜레이트
+
+[2] scripts/01_build_aligned_pairs.py  — 대량 빌드 러너
+    - GEOM-Drugs 순회 -> 필터 -> pairs.py 로 .pt 변환
+    - 실패 카운트/로그, 통계(원자수 분포, 쌍 수) 출력
+    - 목표 규모 ~65k
+
+[3] scripts/02_visualize_pairs.py  — 데이터 게이트 검증
+    - 무작위 N쌍을 SDF로 내보내 reference+x1 겹침 육안 확인
+    - shape overlap / RMSD 통계 재확인
+
+
+================================================================================
+ PHASE 2 · flow-matching 코어 (조건 없이)                             [x] 완료
+================================================================================
+- 목표: 백본 위에 생성 엔진을 얹어 "조건 없는" 3D 구조 생성부터 성립시킴
+- 게이트 A: 소수 분자에서 정상 결합길이의 3D 구조 생성
+- 결과: harmonic 20k + EMA + source정렬 -> aligned 0.694, bond 1.612/0.326 [PASS]
+- ★핵심: 등변 백본은 source->target Kabsch 정렬 필수(없으면 생성 원리상 불가).
+  train loss 내려가도 생성 정체(1.2)였다가, 정렬 추가로 0.69로 급락.
+  (flow/path.py kabsch_align_source_to_target, FlowConfig.kabsch_source_align)
+  + EMA(train.py class EMA) 추가. raw RMSD는 큰 게 정상(방향=등변성 처리).
+
+[1] flow/prior.py  — 시작 분포(source)
+    - HarmonicSampler : 결합 라플라시안 기반 (시작부터 결합거리 ~1.5Å)
+    - GaussianSampler : fallback (게이트 A 이전 비교용)
+    - x0 ~ prior(bonds)
+
+[2] flow/path.py  — 보간 경로
+    - linear path : x_t=(1-t)x0+t·x1, 목표속도 u=x1-x0
+    - (옵션) Kabsch source->target 정렬  ※ pc@r vs pc@r.T transpose 버그 주의
+    - 단위테스트: 정확 정렬쌍에서 정렬 잔차 ~0 확인
+
+[3] flow/loss.py  — 목적함수
+    - batchwise_l2 : 분자별 ||v_θ - u|| 평균 -> 배치 평균
+    - 보조손실 없음 (bond/clash penalty 금지, SPEC §4.3)
+
+[4] sampler.py  — ODE 적분 (생성)
+    - Euler / few-step 적분, t: 0 -> 1
+    - (포켓 UFF 가이던스 훅은 Phase 7에서 연결)
+
+[5] train.py  — 학습 루프 (v0, 조건 없음)
+    - 배치 로드 -> t 샘플 -> x0 샘플 -> x_t -> v_θ -> loss -> step
+    - clip_grad_norm + nan_to_num (과거 NaN 크래시 방지)
+    - best 즉시 저장 + NaN step 롤백
+
+[6] scripts/03_smoke_generate.py  — 게이트 A 검증
+    - 합성/소수 분자로 학습 -> 샘플 -> 결합길이/각 정상성 점검
+
+
+================================================================================
+ PHASE 4 · reference 조건화                                           [x] 완료
+================================================================================
+- 목표: reference 형상을 네트워크에 주입 (query<->reference 메시지패싱)
+- 게이트: 등변성 테스트 재통과 -> joint 회전 rot err 2.11e-15 [PASS]
+
+[1] backbone/embedding.py  (확장 완료)
+    - is_ref 플래그 임베딩(불변) 추가, zero-init 으로 Phase2 호환
+[2] backbone/network.py  (확장 완료)
+    - forward(z,pos,t,batch, ref_z,ref_pos,ref_batch): query+ref 를 한 그래프로
+    - reference 는 상대 기하로만 조건 주입, 속도장 출력은 query 만 반환
+[3] tests/test_equivariance.py  (확장 완료)
+    - check_conditional_equivariance: joint(query+ref) 회전 등변성 < 1e-5
+[4] 학습/샘플 조건화 연결 (완료)
+    - flow/path.py center_by_reference: reference COM 기준 중심화(placement 보존)
+    - backbone/utils.py scatter_mean
+    - train.py flow_train_step: batch 에 ref_z 있으면 조건부 학습
+    - sampler.py ode_sample: ref_* 인자로 조건부 샘플(ref 고정)
+    - tests/test_conditional_flow.py: 조건부 학습/샘플 경로 로컬 검증 [PASS]
+
+
+================================================================================
+ PHASE 5 · overfit-100 (capacity 게이트)                             [~] 러너완료
+================================================================================
+- 목표: 100개 정렬쌍을 "암기"시켜 모델 용량 확인 (일반화 전 필수 관문)
+- 게이트 B: median aligned RMSD < 2Å (과거 성공수치 raw 1.67 / aligned 1.29)
+- 상태: 서버 실학습 진행. 조건부 경로 어려움 확정, 게이트 B 미통과.
+  · non-force: median aligned 3.365, 8/100.
+  · force-align(오라클 회전제거 진단): 2.263, 32/100 (대폭 개선이나 여전히 FAIL).
+  · 결론: 회전 문제 확인 + 용량/수렴 한계 공존. 오라클조차 FAIL → 회전보정만으론 부족.
+  · 다음: --n 20 용량vs개수 분리 → 이후 [테스트가능 회전보정(ref프레임 정렬) + 용량↑].
+- ⚠️ 조건부 경로(source 정렬 OFF) — Gate A(비조건)가 검증 안 한 regime, 리스크 현실화.
+
+[1] scripts/04_overfit100.py  (완료)
+    - 실.pt 100개 로드 -> collate(조건부) -> PrecomputedHarmonicSampler(eigh 1회)
+    - train_flow(조건부, EMA on, source정렬 off) -> 조건부 ODE 샘플
+    - median aligned/raw RMSD, aligned<2A 비율 리포트
+    - 판정: 못 외우면 조건부 경로 진단(백본/조건화/prior 배치)
+[2] flow/prior.py PrecomputedHarmonicSampler (완료) — 고유분해 캐시
+[3] train.py train_flow(prior=...) (완료) — 캐시 prior 주입
+
+
+================================================================================
+ PHASE 6 · 일반화                                                     [ ] 예정
+================================================================================
+- 목표: full 65k + held-out val 5% 로 진짜 학습
+- 게이트 C: val aligned RMSD < prior source RMSD(~4.3Å)
+
+[1] scripts/05_train_full.py
+    - batch16, steps~150k, lr2e-4, --source-type harmonic
+    - train/val split (분자 누수 없게 스캐폴드 기준 분할 권장)
+    - 주기적 val aligned RMSD 로깅 / best 체크포인트
+
+[2] scripts/06_diagnose_generalization.py
+    - val 실패 시 원인 분해 (백본 / 조건화 / 데이터 / prior)
+
+
+================================================================================
+ PHASE 7 · 평가 + 포켓 가이던스                                       [ ] 예정
+================================================================================
+- 목표: DISCO식 평가 프로토콜 + 포켓 UFF 가이던스(추론 전용)
+- 게이트: Top-1 RMSD 산출
+
+[1] guidance.py  — 포켓 UFF 가이던스
+    - 추론 시 ODE 각 스텝 속도에 UFF 그래디언트 가산
+    - 네트워크 입력에는 절대 넣지 않음 (SPEC §2)
+
+[2] evaluation.py  — 지표
+    - Top-1 RMSD @ 1/2/3Å
+    - Kabsch-aligned RMSD (형상만)
+    - TanimotoCombo 랭킹
+
+[3] scripts/07_evaluate_disco.py  — 벤치마크 러너
+    - 복합체별 다수(예 30) 샘플 -> 랭킹 -> Top-1 집계
+    - prior 대비 개선 확인
+
+
+================================================================================
+ 진행 순서 요약
+================================================================================
+ [x] Phase 0  설계 명세
+ [x] Phase 3  등변 백본 (선행) + 등변성 게이트 통과
+ [x] Phase 2  flow-matching 코어  -> 게이트 A PASS (aligned 0.694)
+ [~] Phase 1  데이터 파이프라인   -> 코드완료+로컬왕복, 실빌드/육안게이트 서버 대기
+ [x] Phase 4  reference 조건화    -> 등변성 재통과 + 학습/샘플 연결
+ [~] Phase 5  overfit-100        -> 러너완료, 서버 실학습 대기  ★ 다음
+ [x] Phase 1  실데이터 빌드      -> 65000 fail0, 데이터게이트 PASS(shapeT 0.558)
+ [ ] Phase 6  일반화             -> 게이트 C (val 개선)
+ [ ] Phase 7  평가 + 포켓 가이던스 -> Top-1 RMSD
+
+
+================================================================================
+ 로컬/서버 작업 분리 (2026-07-21 확정)
+================================================================================
+- 로컬(노트북): 성능 낮고 소음 큼 -> "코드가 도는지"만 초소량 검증
+    PYTHONPATH=. python -m etflowalign.tests.test_equivariance   # 등변성 게이트
+    PYTHONPATH=. python -m etflowalign.tests.test_smoke_run      # 초소형 실행확인(수초)
+    * 절대 로컬에서 대규모 학습 돌리지 말 것.
+- 서버(A10): 실제 학습/게이트 판정
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python etflowalign/scripts/03_smoke_generate.py \
+        --prior harmonic --mols 4 --steps 8000 --device cuda
+
+
+================================================================================
+ 서버/GPU 운영 노트
+================================================================================
+- 타깃: 공용 GPU 서버, NVIDIA A10 x4 (각 23GB), CUDA 13.0, Driver 580.82.07
+- 공용이므로 GPU 선택 필수: 사용 중인 카드 피하고 빈 카드 지정
+    CUDA_VISIBLE_DEVICES=1 python ...   (0번은 종종 점유됨)
+- 코드는 device-agnostic: model.to("cuda") + 배치를 GPU로 옮기면 그대로 동작
+- A10 = Ampere -> tf32/bf16 지원. 대규모 학습 시 torch.set_float32_matmul_precision("high") 권장
+- 서버 파일 범위 규칙: /gpfs/.../users/hosungkim 안에서만 생성/수정 (메모리 준수)
+
+[성능 부채 — Phase 6(full 65k) 전 필수 벡터화]
+  (a) flow/prior.py HarmonicSampler: 분자별 Python 루프 + .tolist() + eigh
+      -> GPU<->CPU 동기화 폭발. 대안: eigen-decomp 사전계산 or 배치 eigh
+  (b) flow/path.py center_pos / prior COM 루프: 분자별 for + .item()
+      -> scatter_mean 기반 벡터화로 교체
+  (c) backbone build_radius_graph: O(N^2) full pairwise. drug-sized/A10 OK,
+      대형 배치에선 메모리 증가 -> 필요 시 radius_graph(torch_cluster) 교체
+  * Phase 2~5(소규모/overfit)에서는 그대로 무방.
+
+
+================================================================================
+ 부록 · 파일 트리 (목표 최종형)
+================================================================================
+etflowalign/
+├── SPEC.md                         [x]
+├── tree.txt                        (이 문서)
+├── __init__.py                     [x]
+├── backbone/
+│   ├── __init__.py                 [x]
+│   ├── utils.py                    [x]
+│   ├── rbf.py                      [x]
+│   ├── layers.py                   [x]
+│   ├── embedding.py                [x] (Phase 4에서 확장)
+│   └── network.py                  [x] (Phase 4에서 확장)
+├── flow/
+│   ├── __init__.py                 [x]
+│   ├── prior.py                    [x]
+│   ├── path.py                     [x]
+│   └── loss.py                     [x]
+├── data/
+│   ├── __init__.py                 [x]
+│   └── pairs.py                    [x]
+├── guidance.py                     [ ]
+├── sampler.py                      [x]
+├── train.py                        [x] (Phase 2 조건없음 버전)
+├── evaluation.py                   [ ]
+├── scripts/
+│   ├── 01_build_aligned_pairs.py   [x]
+│   ├── 02_visualize_pairs.py       [x]
+│   ├── 03_smoke_generate.py        [x]
+│   ├── 04_overfit100.py            [x]
+│   ├── 05_train_full.py            [ ]
+│   ├── 06_diagnose_generalization.py [ ]
+│   └── 07_evaluate_disco.py        [ ]
+└── tests/
+    ├── __init__.py                 [x]
+    ├── test_equivariance.py        [x] (Phase3 + Phase4 조건화)
+    ├── test_smoke_run.py           [x] (로컬 초소량 실행확인)
+    ├── test_data_pairs.py          [x] (SDF->payload->batch->model 왕복)
+    └── test_conditional_flow.py    [x] (조건부 학습/샘플 경로)
+================================================================================

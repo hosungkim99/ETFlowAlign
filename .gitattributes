@@ -1,0 +1,3 @@
+# Force LF line endings for shell/Slurm scripts so they run on Linux when committed from Windows.
+*.sh text eol=lf
+*.slurm text eol=lf
