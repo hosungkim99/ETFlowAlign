@@ -253,7 +253,7 @@
     PYTHONPATH=. python -m etflowalign.tests.test_data_pairs     # 데이터 왕복
     PYTHONPATH=. python -m etflowalign.tests.test_conditional_flow
     * 절대 로컬에서 대규모 학습 돌리지 말 것. 코드는 파일 통째 복사로 서버 동기화.
-- 서버(A10): 실제 학습/게이트 판정 = ★SLURM(sbatch)만★ (로그인노드 직접실행 금지=감사대상)
+- 서버(GPU): 실제 학습/게이트 판정 = ★SLURM(sbatch)만★ (로그인노드 직접실행 금지=감사대상)
     N=1 UNCOND=--unconditional MICRO=8 sbatch --time=00:40:00 etflowalign/scripts/run_overfit.sh
     · 확인: squeue --me   |   tail -40 $(ls -t etfa_of_*.log | head -1)
     · 큐 붐비면 짧은 --time 으로 backfill 유도(짧은 job이 빈틈에 먼저 들어감)
@@ -263,19 +263,18 @@
 ================================================================================
  서버/GPU 운영 노트
 ================================================================================
-- 타깃: 공용 GPU 서버, NVIDIA A10 x4 (각 23GB), CUDA 13.0, Driver 580.82.07
-- 공용이므로 GPU 선택 필수: 사용 중인 카드 피하고 빈 카드 지정
-    CUDA_VISIBLE_DEVICES=1 python ...   (0번은 종종 점유됨)
+- 타깃: 공용 GPU 클러스터 (Ampere급 GPU, ~24GB VRAM/카드), SLURM 관리
+- 공용이므로 반드시 SLURM(sbatch)으로 자원 요청 (로그인노드 직접실행 금지)
 - 코드는 device-agnostic: model.to("cuda") + 배치를 GPU로 옮기면 그대로 동작
-- A10 = Ampere -> tf32/bf16 지원. 대규모 학습 시 torch.set_float32_matmul_precision("high") 권장
-- 서버 파일 범위 규칙: /gpfs/.../users/hosungkim 안에서만 생성/수정 (메모리 준수)
+- Ampere급 -> tf32/bf16 지원. 대규모 학습 시 torch.set_float32_matmul_precision("high") 권장
+- 서버 파일 범위 규칙: 본인 사용자 디렉터리 안에서만 생성/수정
 
 [성능 부채 — Phase 6(full 65k) 전 필수 벡터화]
   (a) flow/prior.py HarmonicSampler: 분자별 Python 루프 + .tolist() + eigh
       -> GPU<->CPU 동기화 폭발. 대안: eigen-decomp 사전계산 or 배치 eigh
   (b) flow/path.py center_pos / prior COM 루프: 분자별 for + .item()
       -> scatter_mean 기반 벡터화로 교체
-  (c) backbone build_radius_graph: O(N^2) full pairwise. drug-sized/A10 OK,
+  (c) backbone build_radius_graph: O(N^2) full pairwise. drug-sized/일반GPU OK,
       대형 배치에선 메모리 증가 -> 필요 시 radius_graph(torch_cluster) 교체
   * Phase 2~5(소규모/overfit)에서는 그대로 무방.
 

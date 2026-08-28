@@ -1,4 +1,4 @@
-# ETFlowAlign 서버 실행 가이드 (A10 x4, CUDA, SLURM)
+# ETFlowAlign 서버 실행 가이드 (GPU 클러스터, SLURM)
 
 > **원칙: 모든 compute 는 SLURM(sbatch)으로만.** 로그인 노드 직접 실행·srun 잡 금지(감사 대상).
 > 코드는 로컬에서 작성 → 서버로 **파일 통째 복사** 동기화(부분 편집 금지 — 유령버그 이력).
@@ -6,7 +6,7 @@
 
 ```bash
 # ── 채울 변수 ─────────────────────────────────────────────
-export CODE=/gpfs/deepfold/users/hosung/work/ETFlowAlign   # etflowalign/ 의 부모
+export CODE=/path/to/ETFlowAlign   # etflowalign/ 패키지의 부모 디렉터리
 cd $CODE
 ```
 
@@ -80,11 +80,11 @@ N=20 UNCOND=--unconditional LOAD=$CODE/overfit_20_uc_ckpt.pt SAMPLE=500 sbatch e
 squeue --me                              # 내 job 상태 (PD 대기 / R 실행)
 squeue --me --start                      # 예상 시작 시각
 tail -40 $(ls -t etfa_of_*.log | head -1)   # 최신 로그 끝
-sinfo -p a10,a40,h100                     # 파티션별 여유
+sinfo                                     # 파티션별 여유
 ```
 - **큐가 붐벼 안 잡히면 짧은 `--time`으로 backfill 유도**(예 `--time=00:10:00`) — 짧은 job이
   큰 job들 사이 빈틈에 먼저 들어감. 필요 자원만 짧게 요청 = 빨리 실행.
-- 덜 붐비는 파티션: `sbatch --partition=a40 ...` (a40/h100도 NVIDIA, 코드 그대로 동작).
+- 덜 붐비는 파티션: `sbatch --partition=<partition> ...` (다른 GPU 파티션도 코드 그대로 동작).
 
 ---
 
@@ -92,4 +92,4 @@ sinfo -p a10,a40,h100                     # 파티션별 여유
 - HarmonicSampler eigh/파이썬 루프, center_pos 루프 → scatter 기반 벡터화.
   (overfit 소규모는 PrecomputedHarmonicSampler 캐시로 완화됨)
 - build_radius_graph O(N^2) — drug-sized/미니배치8 OK, 대형 배치서 메모리↑.
-- 대규모 학습 시 `torch.set_float32_matmul_precision("high")` (A10 tf32).
+- 대규모 학습 시 `torch.set_float32_matmul_precision("high")` (tf32 지원 GPU).

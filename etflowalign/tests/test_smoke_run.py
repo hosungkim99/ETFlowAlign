@@ -1,7 +1,7 @@
 """로컬 최소 검증: 코드 경로가 예외 없이 도는가 (게이트 판정 아님).
 
 노트북에서 소음/부하 없이 몇 초 안에 끝나도록 초소형 모델·3스텝만 돌린다.
-실제 학습/게이트 판정은 A10 서버에서 (scripts/03_smoke_generate.py).
+실제 학습/게이트 판정은 GPU 서버에서 (scripts/03_smoke_generate.py).
 
 직접 실행: python -m etflowalign.tests.test_smoke_run
 """
