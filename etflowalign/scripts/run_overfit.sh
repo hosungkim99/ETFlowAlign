@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --output=%x_%j.log
 #SBATCH --time=02:00:00
-# 필요 시 파티션 지정: #SBATCH --partition=a10
+# 필요 시 파티션 지정: #SBATCH --partition=<partition>
 
 # overfit-100 진단 러너 (SLURM 배치 제출용).
 # 사용 예:
@@ -16,7 +16,7 @@
 set -e
 
 # ── 경로/환경 ─────────────────────────────────────────────
-CODE=${CODE:-/gpfs/deepfold/users/hosung/work/ETFlowAlign}
+CODE=${CODE:?export CODE=<ETFlowAlign 패키지의 부모 디렉터리>}
 cd "$CODE"
 
 # batch 셸은 rc 를 안 읽으므로 conda 를 명시적으로 활성화
