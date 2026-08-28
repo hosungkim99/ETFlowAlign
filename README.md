@@ -40,22 +40,65 @@ flowchart LR
 
 ---
 
-## 용어 설명 (수식)
+## 용어 설명 (말 + 수식)
 
-$N$ = 원자 수, $x \in \mathbb{R}^{N\times 3}$ = 원자 좌표, $t \in [0,1]$ = 시간, $\theta$ = 신경망 파라미터.
+기호: $N$ = 원자 수, $x \in \mathbb{R}^{N\times 3}$ = 원자 좌표, $t \in [0,1]$ = 시간, $\theta$ = 신경망 파라미터.
 
-| 용어 | 수식 정의 |
-|---|---|
-| **원자종 · 결합** | 분자 = 그래프 $\mathcal{G}=(z,\,E)$, 원자종 $z \in \mathbb{Z}^{N}$, 결합 $E \subseteq \{(i,j)\}$ |
-| **query / reference** | query: $(z^q, E^q)$ + 타깃 $x_1 \in \mathbb{R}^{N_q\times 3}$ ／ reference: $(z^r, x^r)$, $x^r \in \mathbb{R}^{N_r\times 3}$ |
-| **harmonic prior** | $x_0 \sim \mathcal{N}(0,\,L^{+})$, 라플라시안 $L=D-A$, 에너지 $E(x)=\tfrac12\,x^\top L x$;  샘플 $x_0 = U\,\mathrm{diag}(\lambda^{-1/2})\,\varepsilon,\ \varepsilon\sim\mathcal{N}(0,I)$ |
-| **속도장 $v_\theta$** | $v_\theta:(x_t,\,t)\mapsto v_\theta(x_t,t)\in\mathbb{R}^{N\times 3}$, 흐름 $\dfrac{dx}{dt}=v_\theta(x,t)$ |
-| **flow matching (학습)** | 경로 $x_t=(1-t)\,x_0+t\,x_1$, 목표 $u=x_1-x_0$, 손실 $\mathcal{L}=\mathbb{E}\,\lVert v_\theta(x_t,t)-u\rVert^2$ |
-| **등변 백본** | $\forall R\in SO(3),\ \tau\in\mathbb{R}^3:\ v_\theta(Rx+\tau,\,t)=R\,v_\theta(x,t)$  (스칼라 피처 $h(Rx)=h(x)$) |
-| **조건화** | reference 조건부 속도장 $v_\theta(x_t,\,t \mid x^r)$  (무조건: $v_\theta(x_t,t)$) |
-| **상대 기하** | 거리 $r_{ij}=\lVert x_j-x_i\rVert$ (불변), 방향 $\hat{u}_{ij}=\dfrac{x_j-x_i}{r_{ij}}$ (등변); 절대 $x_i$ 대신 $(r_{ij},\hat u_{ij})$만 입력 |
-| **UFF Guidance** | 추론 시 $v \leftarrow v_\theta(x,t) - \gamma\,\nabla_x E_{\mathrm{UFF}}(x;\,\mathrm{pocket})$ ($\gamma$=세기, $E_\mathrm{UFF}$=UFF 에너지) |
-| **ODE 적분** | $x_1 = x_0 + \displaystyle\int_0^1 v_\theta(x_t,t)\,dt$;  Euler: $x_{t+\Delta t}=x_t+\Delta t\,v_\theta(x_t,t)$ |
+### 원자종 · 결합
+각 원자가 무슨 원소인지(**원자종**: 탄소 C·산소 O·질소 N…)와 어느 원자끼리 붙어있는지(**결합**)로 분자를 "그래프"로 표현합니다.
+
+$$\mathcal{G} = (z,\ E), \qquad z \in \mathbb{Z}^{N}\ (\text{원자종}), \qquad E \subseteq \{(i,j)\}\ (\text{결합})$$
+
+### query / reference
+**query** = 우리가 3D 구조를 생성할 대상 분자. **reference** = query가 형상을 맞춰야 할 기준 분자.
+
+$$\text{query: } (z^q, E^q)\ +\ \text{타깃 } x_1 \in \mathbb{R}^{N_q\times 3}, \qquad \text{reference: } (z^r,\ x^r),\ \ x^r \in \mathbb{R}^{N_r\times 3}$$
+
+### harmonic prior
+생성의 **출발점 노이즈**를 만드는 방법. 완전 무작위가 아니라, **결합된 원자끼리 용수철로 묶인 듯 가깝게** 배치한 시작 구조입니다 (harmonic = 조화진동 = 용수철). 에너지가 결합 길이 제곱합인 조화 시스템의 가우시안이며, 결합 그래프 라플라시안 $L$의 유사역을 공분산으로 씁니다.
+
+$$E(x) = \sum_{(i,j)\in E} \lVert x_i - x_j \rVert^2 = \tfrac{1}{2}\,x^\top L x, \qquad L = D - A$$
+
+$$x_0 \sim \mathcal{N}(0,\ L^{+}), \qquad x_0 = U\,\mathrm{diag}(\lambda^{-1/2})\,\varepsilon,\quad L = U\Lambda U^\top,\ \ \varepsilon \sim \mathcal{N}(0, I)$$
+
+### 속도장 (velocity field)
+각 원자를 **"어느 방향으로 얼마나 움직일지"** 알려주는 화살표들의 모음(벡터장). 이 화살표를 따라가면 노이즈가 분자 모양이 됩니다.
+
+$$v_\theta : \mathbb{R}^{N\times3} \times [0,1] \to \mathbb{R}^{N\times3}, \qquad \frac{dx}{dt} = v_\theta(x,\ t)$$
+
+### flow matching (학습 방식)
+시작점 $x_0$와 타깃 $x_1$을 **직선으로 잇고**, 그 직선의 방향 $x_1 - x_0$를 속도장이 맞추도록 학습합니다.
+
+$$x_t = (1-t)\,x_0 + t\,x_1, \qquad u = x_1 - x_0$$
+
+$$\mathcal{L}(\theta) = \mathbb{E}_{t,\,x_0,\,x_1}\Big[\, \lVert\, v_\theta(x_t,\ t) - u \,\rVert^2 \,\Big]$$
+
+### 등변 백본 (equivariant backbone)
+속도장을 예측하는 **핵심 신경망**. **등변** = 입력 분자를 회전·이동시키면 출력 화살표도 **똑같이 회전·이동** → 회전 대칭(물리 법칙)을 보존합니다. 스칼라 특징은 불변, 벡터 특징은 등변.
+
+$$v_\theta(Rx + \tau,\ t) = R\,v_\theta(x,\ t) \qquad \forall\, R \in SO(3),\ \tau \in \mathbb{R}^3$$
+
+$$h(Rx) = h(x)\ \ (\text{스칼라: 불변}), \qquad \mathrm{vec}(Rx) = R\,\mathrm{vec}(x)\ \ (\text{벡터: 등변})$$
+
+### 조건화 (conditioning)
+생성을 **"무엇에 맞춰서"** 할지 정보를 주는 것. 여기선 reference 형상 $x^r$을 조건으로 넣어 그 모양에 맞는 분자를 생성합니다.
+
+$$v_\theta(x_t,\ t \mid x^r)\ \ (\text{조건부}), \qquad v_\theta(x_t,\ t)\ \ (\text{무조건})$$
+
+### 상대 기하 (relative geometry)
+절대 좌표값(xyz 그 자체)이 아니라 **원자 사이의 거리·방향** 같은 상대 관계만 입력합니다. 회전·이동해도 안 변해서 **등변성 유지**에 씁니다.
+
+$$r_{ij} = \lVert x_j - x_i \rVert\ \ (\text{거리, 불변}), \qquad \hat{u}_{ij} = \frac{x_j - x_i}{r_{ij}}\ \ (\text{방향, 등변})$$
+
+### UFF Guidance
+UFF(범용 힘장) = 분자 에너지를 계산하는 간단한 물리 모델. 생성 시 단백질 **포켓과 안 부딪히게**, UFF 에너지의 그래디언트로 궤적을 살짝 밀어줍니다 (추론 전용, Phase 7 예정).
+
+$$v \leftarrow v_\theta(x,\ t) - \gamma\,\nabla_x E_{\mathrm{UFF}}(x;\ \mathrm{pocket}) \qquad (\gamma = \text{가이던스 세기})$$
+
+### ODE 적분
+속도장(화살표)을 따라 시작점에서 **조금씩 여러 번** 이동시켜 최종 구조에 도달하는 수치 계산.
+
+$$x_1 = x_0 + \int_0^1 v_\theta(x_t,\ t)\,dt \qquad \xrightarrow{\ \text{Euler}\ } \qquad x_{t+\Delta t} = x_t + \Delta t\,v_\theta(x_t,\ t)$$
 
 ### 입출력 정리
 - **입력**: query 분자 그래프(원자종·결합) + reference 리간드의 3D 형상
